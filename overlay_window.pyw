@@ -115,6 +115,8 @@ user32.MonitorFromPoint.argtypes = [Point, wintypes.DWORD]
 user32.MonitorFromPoint.restype = wintypes.HANDLE
 user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MonitorInfo)]
 user32.GetMonitorInfoW.restype = wintypes.BOOL
+user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(Rect)]
+user32.GetWindowRect.restype = wintypes.BOOL
 
 HWND_TOPMOST = wintypes.HWND(-1)
 
@@ -140,9 +142,40 @@ def _set_native_topmost(window: tk.Misc) -> None:
     )
 
 
-def _geometry(width: int, height: int, x: int, y: int) -> str:
-    """Build Tk geometry text that also handles negative monitor coordinates."""
-    return f"{width}x{height}{x:+d}{y:+d}"
+def _set_absolute_geometry(
+    window: tk.Misc,
+    *,
+    width: int | None = None,
+    height: int | None = None,
+    x: int | None = None,
+    y: int | None = None,
+) -> None:
+    """Move/resize a Tk window using absolute virtual-screen coordinates.
+
+    Tk treats negative geometry coordinates as offsets from the right or bottom
+    edge. SetWindowPos avoids that behavior and supports monitors placed to the
+    left or above the primary display.
+    """
+    move_window = x is not None and y is not None
+    resize_window = width is not None and height is not None
+    flags = SWP_NOACTIVATE
+    if not move_window:
+        flags |= SWP_NOMOVE
+    if not resize_window:
+        flags |= SWP_NOSIZE
+
+    hwnd = _top_level_handle(window)
+    success = user32.SetWindowPos(
+        wintypes.HWND(hwnd),
+        HWND_TOPMOST,
+        int(x or 0),
+        int(y or 0),
+        int(width or 0),
+        int(height or 0),
+        flags,
+    )
+    if not success:
+        raise ctypes.WinError(ctypes.get_last_error())
 
 
 def _monitor_areas_at(x: int, y: int) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int]]:
@@ -429,7 +462,13 @@ class OverlayApp:
         left, top, right, bottom = work_area
         x = left + max(0, (right - left - WINDOW_WIDTH) // 2)
         y = top + max(0, (bottom - top - WINDOW_HEIGHT) // 2)
-        self.root.geometry(_geometry(WINDOW_WIDTH, WINDOW_HEIGHT, x, y))
+        _set_absolute_geometry(
+            self.root,
+            width=WINDOW_WIDTH,
+            height=WINDOW_HEIGHT,
+            x=x,
+            y=y,
+        )
 
     def _begin_drag(self, event: tk.Event) -> None:
         if self.locked:
@@ -445,7 +484,7 @@ class OverlayApp:
         offset_x, offset_y = self._drag_origin
         x = event.x_root - offset_x
         y = event.y_root - offset_y
-        self.root.geometry(f"{x:+d}{y:+d}")
+        _set_absolute_geometry(self.root, x=x, y=y)
 
     def _end_drag(self, event: tk.Event) -> None:
         self._drag_origin = None
@@ -472,7 +511,7 @@ class OverlayApp:
         start_x, start_y, start_width, start_height = self._resize_origin
         width = max(MIN_WIDTH, start_width + event.x_root - start_x)
         height = max(MIN_HEIGHT, start_height + event.y_root - start_y)
-        self.root.geometry(f"{width}x{height}")
+        _set_absolute_geometry(self.root, width=width, height=height)
 
     def _end_resize(self, _event: tk.Event) -> None:
         self._resize_origin = None
@@ -547,7 +586,13 @@ class OverlayApp:
     def _finish_collapse(self, target: tuple[int, int, int, int]) -> None:
         self.root.withdraw()
         self._ball_geometry = target
-        self.ball_window.geometry(_geometry(*target))
+        _set_absolute_geometry(
+            self.ball_window,
+            width=target[0],
+            height=target[1],
+            x=target[2],
+            y=target[3],
+        )
         if self.visible:
             self.ball_window.deiconify()
             self.ball_window.attributes("-topmost", True)
@@ -606,7 +651,13 @@ class OverlayApp:
         self.animating = True
         self.ball_window.withdraw()
         self.root.minsize(1, 1)
-        self.root.geometry(_geometry(*start))
+        _set_absolute_geometry(
+            self.root,
+            width=start[0],
+            height=start[1],
+            x=start[2],
+            y=start[3],
+        )
         if self.visible:
             self.root.deiconify()
             self.root.attributes("-topmost", True)
@@ -641,7 +692,13 @@ class OverlayApp:
             round(start_value + (target_value - start_value) * eased)
             for start_value, target_value in zip(start, target)
         )
-        self.root.geometry(_geometry(*current))
+        _set_absolute_geometry(
+            self.root,
+            width=current[0],
+            height=current[1],
+            x=current[2],
+            y=current[3],
+        )
         self.root.update_idletasks()
 
         if step >= ANIMATION_STEPS:
@@ -685,7 +742,13 @@ class OverlayApp:
             - 10
         )
         y = self.root.winfo_y() + (TITLE_HEIGHT - LOCK_HEIGHT) // 2 + 1
-        self.lock_window.geometry(_geometry(LOCK_WIDTH, LOCK_HEIGHT, x, y))
+        _set_absolute_geometry(
+            self.lock_window,
+            width=LOCK_WIDTH,
+            height=LOCK_HEIGHT,
+            x=x,
+            y=y,
+        )
         self.lock_window.deiconify()
         self.lock_window.attributes("-topmost", True)
         self.lock_window.lift()
@@ -782,6 +845,24 @@ class OverlayApp:
 def _self_test() -> None:
     app = OverlayApp(visible=False)
     app.root.update()
+
+    _set_absolute_geometry(
+        app.root,
+        width=MIN_WIDTH,
+        height=MIN_HEIGHT,
+        x=-160,
+        y=-120,
+    )
+    app.root.update_idletasks()
+    native_rect = Rect()
+    root_handle = _top_level_handle(app.root)
+    assert user32.GetWindowRect(
+        wintypes.HWND(root_handle),
+        ctypes.byref(native_rect),
+    ), "native window rectangle is unavailable"
+    assert native_rect.left == -160, "negative X coordinate was mirrored"
+    assert native_rect.top == -120, "negative Y coordinate was mirrored"
+
     app.set_locked(True)
     app.root.update()
     assert app.click_through_style_is_set(), "click-through style was not enabled"
