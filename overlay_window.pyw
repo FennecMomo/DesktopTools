@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import ctypes
 import sys
+import time
 import tkinter as tk
+from collections.abc import Callable
 from ctypes import wintypes
 
 
@@ -16,6 +18,11 @@ TITLE_HEIGHT = 48
 LOCK_WIDTH = 68
 LOCK_HEIGHT = 32
 CLOSE_AREA_WIDTH = 48
+BALL_SIZE = 58
+BALL_MARGIN = 6
+EDGE_TRIGGER_DISTANCE = 28
+ANIMATION_STEPS = 10
+ANIMATION_DELAY_MS = 14
 
 BG_OUTER = "#11141A"
 BG_TITLE = "#20242D"
@@ -29,6 +36,7 @@ ACCENT_HOVER = "#80E5B7"
 LOCKED_ACCENT = "#F5B85C"
 LOCKED_HOVER = "#FFC873"
 CLOSE_HOVER = "#E05260"
+TRANSPARENT_KEY = "#010203"
 
 GWL_EXSTYLE = -20
 WS_EX_TRANSPARENT = 0x00000020
@@ -37,6 +45,29 @@ SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
 SWP_NOACTIVATE = 0x0010
 SWP_FRAMECHANGED = 0x0020
+MONITOR_DEFAULTTONEAREST = 0x00000002
+
+
+class Point(ctypes.Structure):
+    _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+
+
+class Rect(ctypes.Structure):
+    _fields_ = [
+        ("left", wintypes.LONG),
+        ("top", wintypes.LONG),
+        ("right", wintypes.LONG),
+        ("bottom", wintypes.LONG),
+    ]
+
+
+class MonitorInfo(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", Rect),
+        ("rcWork", Rect),
+        ("dwFlags", wintypes.DWORD),
+    ]
 
 
 def _enable_dpi_awareness() -> None:
@@ -79,6 +110,10 @@ user32.SetWindowPos.argtypes = [
     wintypes.UINT,
 ]
 user32.SetWindowPos.restype = wintypes.BOOL
+user32.MonitorFromPoint.argtypes = [Point, wintypes.DWORD]
+user32.MonitorFromPoint.restype = wintypes.HANDLE
+user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MonitorInfo)]
+user32.GetMonitorInfoW.restype = wintypes.BOOL
 
 HWND_TOPMOST = wintypes.HWND(-1)
 
@@ -104,12 +139,47 @@ def _set_native_topmost(window: tk.Misc) -> None:
     )
 
 
+def _geometry(width: int, height: int, x: int, y: int) -> str:
+    """Build Tk geometry text that also handles negative monitor coordinates."""
+    return f"{width}x{height}{x:+d}{y:+d}"
+
+
+def _monitor_areas_at(x: int, y: int) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int]]:
+    monitor = user32.MonitorFromPoint(Point(x, y), MONITOR_DEFAULTTONEAREST)
+    info = MonitorInfo()
+    info.cbSize = ctypes.sizeof(MonitorInfo)
+    if not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    monitor_area = (
+        info.rcMonitor.left,
+        info.rcMonitor.top,
+        info.rcMonitor.right,
+        info.rcMonitor.bottom,
+    )
+    work_area = (
+        info.rcWork.left,
+        info.rcWork.top,
+        info.rcWork.right,
+        info.rcWork.bottom,
+    )
+    return monitor_area, work_area
+
+
+def _clamp(value: int, minimum: int, maximum: int) -> int:
+    return max(minimum, min(value, max(minimum, maximum)))
+
+
 class OverlayApp:
     def __init__(self, *, visible: bool = True) -> None:
         self.visible = visible
         self.locked = False
+        self.collapsed = False
+        self.animating = False
         self._drag_origin: tuple[int, int] | None = None
         self._resize_origin: tuple[int, int, int, int] | None = None
+        self._restore_geometry: tuple[int, int, int, int] | None = None
+        self._ball_geometry: tuple[int, int, int, int] | None = None
         self._sync_scheduled = False
 
         self.root = tk.Tk()
@@ -128,6 +198,7 @@ class OverlayApp:
         self._center_window()
         self.root.update_idletasks()
         self._build_lock_window()
+        self._build_ball_window()
 
         self.root.bind("<Configure>", self._on_main_configure, add="+")
         self.root.bind("<Escape>", lambda _event: self.close())
@@ -230,7 +301,7 @@ class OverlayApp:
 
         self.message_label = tk.Label(
             panel,
-            text="拖动顶部栏移动窗口\n点击“锁定”后，鼠标操作会穿透到窗口后方",
+            text="拖动顶部栏移动，拖到屏幕边缘可收起\n点击“锁定”后，鼠标操作会穿透到窗口后方",
             bg=BG_PANEL,
             fg=TEXT,
             justify="center",
@@ -293,12 +364,70 @@ class OverlayApp:
         )
         self.lock_button.pack(fill="both", expand=True)
 
+    def _build_ball_window(self) -> None:
+        self.ball_window = tk.Toplevel(self.root)
+        self.ball_window.withdraw()
+        self.ball_window.overrideredirect(True)
+        self.ball_window.configure(bg=TRANSPARENT_KEY)
+        self.ball_window.attributes("-topmost", True)
+        try:
+            self.ball_window.attributes("-toolwindow", True)
+            self.ball_window.attributes("-transparentcolor", TRANSPARENT_KEY)
+        except tk.TclError:
+            pass
+
+        self.ball_canvas = tk.Canvas(
+            self.ball_window,
+            width=BALL_SIZE,
+            height=BALL_SIZE,
+            bg=TRANSPARENT_KEY,
+            bd=0,
+            highlightthickness=0,
+            cursor="hand2",
+        )
+        self.ball_canvas.pack(fill="both", expand=True)
+        self.ball_shape = self.ball_canvas.create_oval(
+            3,
+            3,
+            BALL_SIZE - 3,
+            BALL_SIZE - 3,
+            fill=BG_TITLE,
+            outline=ACCENT,
+            width=3,
+        )
+        self.ball_canvas.create_text(
+            BALL_SIZE // 2,
+            BALL_SIZE // 2,
+            text="展开",
+            fill=TEXT,
+            font=("Microsoft YaHei UI", 9, "bold"),
+        )
+        self.ball_canvas.bind("<Enter>", self._ball_hover_on)
+        self.ball_canvas.bind("<Leave>", self._ball_hover_off)
+        self.ball_canvas.bind("<ButtonRelease-1>", self._restore_from_ball)
+
+    def _ball_hover_on(self, _event: tk.Event) -> None:
+        self.ball_canvas.itemconfigure(
+            self.ball_shape,
+            fill="#303844",
+            outline=ACCENT_HOVER,
+        )
+
+    def _ball_hover_off(self, _event: tk.Event) -> None:
+        self.ball_canvas.itemconfigure(
+            self.ball_shape,
+            fill=BG_TITLE,
+            outline=ACCENT,
+        )
+
     def _center_window(self) -> None:
-        screen_width = self.root.winfo_screenwidth()
-        screen_height = self.root.winfo_screenheight()
-        x = max(0, (screen_width - WINDOW_WIDTH) // 2)
-        y = max(0, (screen_height - WINDOW_HEIGHT) // 2)
-        self.root.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}+{x}+{y}")
+        cursor = Point()
+        user32.GetCursorPos(ctypes.byref(cursor))
+        _monitor_area, work_area = _monitor_areas_at(cursor.x, cursor.y)
+        left, top, right, bottom = work_area
+        x = left + max(0, (right - left - WINDOW_WIDTH) // 2)
+        y = top + max(0, (bottom - top - WINDOW_HEIGHT) // 2)
+        self.root.geometry(_geometry(WINDOW_WIDTH, WINDOW_HEIGHT, x, y))
 
     def _begin_drag(self, event: tk.Event) -> None:
         if self.locked:
@@ -314,10 +443,15 @@ class OverlayApp:
         offset_x, offset_y = self._drag_origin
         x = event.x_root - offset_x
         y = event.y_root - offset_y
-        self.root.geometry(f"+{x}+{y}")
+        self.root.geometry(f"{x:+d}{y:+d}")
 
-    def _end_drag(self, _event: tk.Event) -> None:
+    def _end_drag(self, event: tk.Event) -> None:
         self._drag_origin = None
+        if self.locked or self.animating or self.collapsed:
+            return
+        target = self._ball_target_at_edge(event.x_root, event.y_root)
+        if target is not None:
+            self._collapse_to_ball(target)
 
     def _begin_resize(self, event: tk.Event) -> None:
         if self.locked:
@@ -340,6 +474,138 @@ class OverlayApp:
     def _end_resize(self, _event: tk.Event) -> None:
         self._resize_origin = None
 
+    def _ball_target_at_edge(
+        self,
+        cursor_x: int,
+        cursor_y: int,
+    ) -> tuple[int, int, int, int] | None:
+        monitor_area, work_area = _monitor_areas_at(cursor_x, cursor_y)
+        monitor_left, monitor_top, monitor_right, monitor_bottom = monitor_area
+        work_left, work_top, work_right, work_bottom = work_area
+
+        distances = {
+            "left": abs(cursor_x - monitor_left),
+            "right": abs((monitor_right - 1) - cursor_x),
+            "top": abs(cursor_y - monitor_top),
+            "bottom": abs((monitor_bottom - 1) - cursor_y),
+        }
+        edge = min(distances, key=distances.get)
+        if distances[edge] > EDGE_TRIGGER_DISTANCE:
+            return None
+
+        center_x = self.root.winfo_x() + self.root.winfo_width() // 2
+        center_y = self.root.winfo_y() + self.root.winfo_height() // 2
+        min_x = work_left + BALL_MARGIN
+        max_x = work_right - BALL_SIZE - BALL_MARGIN
+        min_y = work_top + BALL_MARGIN
+        max_y = work_bottom - BALL_SIZE - BALL_MARGIN
+
+        if edge == "left":
+            x = min_x
+            y = _clamp(center_y - BALL_SIZE // 2, min_y, max_y)
+        elif edge == "right":
+            x = max_x
+            y = _clamp(center_y - BALL_SIZE // 2, min_y, max_y)
+        elif edge == "top":
+            x = _clamp(center_x - BALL_SIZE // 2, min_x, max_x)
+            y = min_y
+        else:
+            x = _clamp(center_x - BALL_SIZE // 2, min_x, max_x)
+            y = max_y
+
+        return BALL_SIZE, BALL_SIZE, x, y
+
+    def _collapse_to_ball(self, target: tuple[int, int, int, int]) -> None:
+        if self.locked or self.collapsed or self.animating:
+            return
+
+        start = (
+            self.root.winfo_width(),
+            self.root.winfo_height(),
+            self.root.winfo_x(),
+            self.root.winfo_y(),
+        )
+        self._restore_geometry = start
+        self.animating = True
+        self.lock_window.withdraw()
+        self.root.minsize(1, 1)
+
+        self._animate_geometry(
+            start,
+            target,
+            lambda: self._finish_collapse(target),
+        )
+
+    def _finish_collapse(self, target: tuple[int, int, int, int]) -> None:
+        self.root.withdraw()
+        self._ball_geometry = target
+        self.ball_window.geometry(_geometry(*target))
+        if self.visible:
+            self.ball_window.deiconify()
+            self.ball_window.attributes("-topmost", True)
+            self.ball_window.lift()
+            _set_native_topmost(self.ball_window)
+        self.collapsed = True
+        self.animating = False
+
+    def _restore_from_ball(self, _event: tk.Event | None = None) -> None:
+        if (
+            not self.collapsed
+            or self.animating
+            or self._restore_geometry is None
+            or self._ball_geometry is None
+        ):
+            return
+
+        start = self._ball_geometry
+        target = self._restore_geometry
+        self.animating = True
+        self.ball_window.withdraw()
+        self.root.minsize(1, 1)
+        self.root.geometry(_geometry(*start))
+        if self.visible:
+            self.root.deiconify()
+            self.root.attributes("-topmost", True)
+            self.root.lift()
+        self._animate_geometry(start, target, self._finish_restore)
+
+    def _finish_restore(self) -> None:
+        self.root.minsize(MIN_WIDTH, MIN_HEIGHT)
+        self.collapsed = False
+        self.animating = False
+        if self.visible:
+            self.root.focus_force()
+        self._sync_lock_window()
+
+    def _animate_geometry(
+        self,
+        start: tuple[int, int, int, int],
+        target: tuple[int, int, int, int],
+        on_complete: Callable[[], None],
+        step: int = 0,
+    ) -> None:
+        progress = min(1.0, step / ANIMATION_STEPS)
+        eased = 1.0 - (1.0 - progress) ** 3
+        current = tuple(
+            round(start_value + (target_value - start_value) * eased)
+            for start_value, target_value in zip(start, target)
+        )
+        self.root.geometry(_geometry(*current))
+        self.root.update_idletasks()
+
+        if step >= ANIMATION_STEPS:
+            on_complete()
+            return
+        self.root.after(
+            ANIMATION_DELAY_MS,
+            lambda: self._animate_geometry(
+                start,
+                target,
+                on_complete,
+                step + 1,
+            ),
+        )
+
     def _on_main_configure(self, event: tk.Event) -> None:
         if event.widget is not self.root or self._sync_scheduled:
             return
@@ -351,7 +617,12 @@ class OverlayApp:
         if not self.lock_window.winfo_exists():
             return
 
-        if not self.visible or self.root.state() != "normal":
+        if (
+            not self.visible
+            or self.collapsed
+            or self.animating
+            or self.root.state() != "normal"
+        ):
             self.lock_window.withdraw()
             return
 
@@ -363,7 +634,7 @@ class OverlayApp:
             - 10
         )
         y = self.root.winfo_y() + (TITLE_HEIGHT - LOCK_HEIGHT) // 2 + 1
-        self.lock_window.geometry(f"{LOCK_WIDTH}x{LOCK_HEIGHT}+{x}+{y}")
+        self.lock_window.geometry(_geometry(LOCK_WIDTH, LOCK_HEIGHT, x, y))
         self.lock_window.deiconify()
         self.lock_window.attributes("-topmost", True)
         self.lock_window.lift()
@@ -422,7 +693,7 @@ class OverlayApp:
             )
             self.status_label.configure(text="●  可操作", fg=ACCENT)
             self.message_label.configure(
-                text="拖动顶部栏移动窗口\n点击“锁定”后，鼠标操作会穿透到窗口后方"
+                text="拖动顶部栏移动，拖到屏幕边缘可收起\n点击“锁定”后，鼠标操作会穿透到窗口后方"
             )
             self.close_button.configure(state="normal", cursor="hand2")
             self.resize_grip.configure(cursor="size_nw_se")
@@ -446,6 +717,11 @@ class OverlayApp:
                 self.lock_window.destroy()
         except (AttributeError, tk.TclError):
             pass
+        try:
+            if self.ball_window.winfo_exists():
+                self.ball_window.destroy()
+        except (AttributeError, tk.TclError):
+            pass
         self.root.destroy()
 
     def run(self) -> None:
@@ -461,8 +737,35 @@ def _self_test() -> None:
     app.set_locked(False)
     app.root.update()
     assert not app.click_through_style_is_set(), "click-through style was not disabled"
+
+    cursor = Point()
+    user32.GetCursorPos(ctypes.byref(cursor))
+    monitor_area, _work_area = _monitor_areas_at(cursor.x, cursor.y)
+    left, top, right, bottom = monitor_area
+    edge_target = app._ball_target_at_edge(left, top + (bottom - top) // 2)
+    assert edge_target is not None, "display edge was not detected"
+
+    app._collapse_to_ball((BALL_SIZE, BALL_SIZE, 10, 10))
+    deadline = time.monotonic() + 2
+    while app.animating and time.monotonic() < deadline:
+        app.root.update()
+        time.sleep(0.01)
+    assert app.collapsed and not app.animating, "window did not collapse to ball"
+    assert app._ball_geometry == (
+        BALL_SIZE,
+        BALL_SIZE,
+        10,
+        10,
+    ), "collapsed ball geometry is incorrect"
+
+    app._restore_from_ball()
+    deadline = time.monotonic() + 2
+    while app.animating and time.monotonic() < deadline:
+        app.root.update()
+        time.sleep(0.01)
+    assert not app.collapsed and not app.animating, "window did not restore from ball"
     app.close()
-    print("Self-test passed: lock/unlock native styles toggle correctly.")
+    print("Self-test passed: lock styles and ball collapse/restore work correctly.")
 
 
 if __name__ == "__main__":
