@@ -1,0 +1,10 @@
+# Local Git authentication material
+.git-auth.local.json
+.git-ssh-key.local
+.git-ssh-key.local.pub
+
+# Python build/cache output
+__pycache__/
+*.py[cod]
+build/
+dist/
