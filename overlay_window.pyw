@@ -20,6 +20,7 @@ LOCK_HEIGHT = 32
 CLOSE_AREA_WIDTH = 48
 BALL_SIZE = 58
 BALL_MARGIN = 6
+RESTORE_MARGIN = 10
 EDGE_TRIGGER_DISTANCE = 28
 ANIMATION_STEPS = 10
 ANIMATION_DELAY_MS = 14
@@ -180,6 +181,7 @@ class OverlayApp:
         self._resize_origin: tuple[int, int, int, int] | None = None
         self._restore_geometry: tuple[int, int, int, int] | None = None
         self._ball_geometry: tuple[int, int, int, int] | None = None
+        self._dock_edge: str | None = None
         self._sync_scheduled = False
 
         self.root = tk.Tk()
@@ -449,9 +451,10 @@ class OverlayApp:
         self._drag_origin = None
         if self.locked or self.animating or self.collapsed:
             return
-        target = self._ball_target_at_edge(event.x_root, event.y_root)
-        if target is not None:
-            self._collapse_to_ball(target)
+        dock_target = self._ball_target_at_edge(event.x_root, event.y_root)
+        if dock_target is not None:
+            target, edge = dock_target
+            self._collapse_to_ball(target, edge)
 
     def _begin_resize(self, event: tk.Event) -> None:
         if self.locked:
@@ -478,7 +481,7 @@ class OverlayApp:
         self,
         cursor_x: int,
         cursor_y: int,
-    ) -> tuple[int, int, int, int] | None:
+    ) -> tuple[tuple[int, int, int, int], str] | None:
         monitor_area, work_area = _monitor_areas_at(cursor_x, cursor_y)
         monitor_left, monitor_top, monitor_right, monitor_bottom = monitor_area
         work_left, work_top, work_right, work_bottom = work_area
@@ -513,9 +516,13 @@ class OverlayApp:
             x = _clamp(center_x - BALL_SIZE // 2, min_x, max_x)
             y = max_y
 
-        return BALL_SIZE, BALL_SIZE, x, y
+        return (BALL_SIZE, BALL_SIZE, x, y), edge
 
-    def _collapse_to_ball(self, target: tuple[int, int, int, int]) -> None:
+    def _collapse_to_ball(
+        self,
+        target: tuple[int, int, int, int],
+        dock_edge: str,
+    ) -> None:
         if self.locked or self.collapsed or self.animating:
             return
 
@@ -526,6 +533,7 @@ class OverlayApp:
             self.root.winfo_y(),
         )
         self._restore_geometry = start
+        self._dock_edge = dock_edge
         self.animating = True
         self.lock_window.withdraw()
         self.root.minsize(1, 1)
@@ -548,6 +556,41 @@ class OverlayApp:
         self.collapsed = True
         self.animating = False
 
+    def _restored_geometry_in_work_area(self) -> tuple[int, int, int, int]:
+        if self._restore_geometry is None or self._ball_geometry is None:
+            raise RuntimeError("restore geometry is unavailable")
+
+        width, height, original_x, original_y = self._restore_geometry
+        _, _, ball_x, ball_y = self._ball_geometry
+        _monitor_area, work_area = _monitor_areas_at(
+            ball_x + BALL_SIZE // 2,
+            ball_y + BALL_SIZE // 2,
+        )
+        left, top, right, bottom = work_area
+
+        available_width = max(1, right - left - RESTORE_MARGIN * 2)
+        available_height = max(1, bottom - top - RESTORE_MARGIN * 2)
+        width = min(width, available_width)
+        height = min(height, available_height)
+
+        min_x = left + RESTORE_MARGIN
+        max_x = right - width - RESTORE_MARGIN
+        min_y = top + RESTORE_MARGIN
+        max_y = bottom - height - RESTORE_MARGIN
+        x = _clamp(original_x, min_x, max_x)
+        y = _clamp(original_y, min_y, max_y)
+
+        if self._dock_edge == "left":
+            x = min_x
+        elif self._dock_edge == "right":
+            x = max_x
+        elif self._dock_edge == "top":
+            y = min_y
+        elif self._dock_edge == "bottom":
+            y = max_y
+
+        return width, height, x, y
+
     def _restore_from_ball(self, _event: tk.Event | None = None) -> None:
         if (
             not self.collapsed
@@ -558,7 +601,8 @@ class OverlayApp:
             return
 
         start = self._ball_geometry
-        target = self._restore_geometry
+        target = self._restored_geometry_in_work_area()
+        self._restore_geometry = target
         self.animating = True
         self.ball_window.withdraw()
         self.root.minsize(1, 1)
@@ -567,10 +611,17 @@ class OverlayApp:
             self.root.deiconify()
             self.root.attributes("-topmost", True)
             self.root.lift()
-        self._animate_geometry(start, target, self._finish_restore)
+        self._animate_geometry(
+            start,
+            target,
+            lambda: self._finish_restore(target),
+        )
 
-    def _finish_restore(self) -> None:
-        self.root.minsize(MIN_WIDTH, MIN_HEIGHT)
+    def _finish_restore(self, target: tuple[int, int, int, int]) -> None:
+        self.root.minsize(
+            min(MIN_WIDTH, target[0]),
+            min(MIN_HEIGHT, target[1]),
+        )
         self.collapsed = False
         self.animating = False
         if self.visible:
@@ -742,21 +793,18 @@ def _self_test() -> None:
     user32.GetCursorPos(ctypes.byref(cursor))
     monitor_area, _work_area = _monitor_areas_at(cursor.x, cursor.y)
     left, top, right, bottom = monitor_area
-    edge_target = app._ball_target_at_edge(left, top + (bottom - top) // 2)
-    assert edge_target is not None, "display edge was not detected"
+    dock_target = app._ball_target_at_edge(right - 1, top + (bottom - top) // 2)
+    assert dock_target is not None, "display edge was not detected"
+    ball_geometry, dock_edge = dock_target
+    assert dock_edge == "right", "right display edge was not selected"
 
-    app._collapse_to_ball((BALL_SIZE, BALL_SIZE, 10, 10))
+    app._collapse_to_ball(ball_geometry, dock_edge)
     deadline = time.monotonic() + 2
     while app.animating and time.monotonic() < deadline:
         app.root.update()
         time.sleep(0.01)
     assert app.collapsed and not app.animating, "window did not collapse to ball"
-    assert app._ball_geometry == (
-        BALL_SIZE,
-        BALL_SIZE,
-        10,
-        10,
-    ), "collapsed ball geometry is incorrect"
+    assert app._ball_geometry == ball_geometry, "collapsed ball geometry is incorrect"
 
     app._restore_from_ball()
     deadline = time.monotonic() + 2
@@ -764,6 +812,17 @@ def _self_test() -> None:
         app.root.update()
         time.sleep(0.01)
     assert not app.collapsed and not app.animating, "window did not restore from ball"
+    assert app._restore_geometry is not None
+    restored_width, restored_height, restored_x, restored_y = app._restore_geometry
+    _, work_area = _monitor_areas_at(
+        ball_geometry[2] + BALL_SIZE // 2,
+        ball_geometry[3] + BALL_SIZE // 2,
+    )
+    work_left, work_top, work_right, work_bottom = work_area
+    assert restored_x + restored_width == work_right - RESTORE_MARGIN
+    assert restored_x >= work_left + RESTORE_MARGIN
+    assert restored_y >= work_top + RESTORE_MARGIN
+    assert restored_y + restored_height <= work_bottom - RESTORE_MARGIN
     app.close()
     print("Self-test passed: lock styles and ball collapse/restore work correctly.")
 
