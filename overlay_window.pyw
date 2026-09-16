@@ -1,14 +1,11 @@
 from __future__ import annotations
 
 import ctypes
-import subprocess
 import sys
 import time
 import tkinter as tk
 from collections.abc import Callable
 from ctypes import wintypes
-from pathlib import Path
-from tkinter import messagebox
 
 
 APP_TITLE = "DesktopTools 自由窗口"
@@ -51,6 +48,31 @@ SWP_NOACTIVATE = 0x0010
 SWP_FRAMECHANGED = 0x0020
 MONITOR_DEFAULTTONEAREST = 0x00000002
 
+WM_NULL = 0x0000
+WM_DESTROY = 0x0002
+WM_CONTEXTMENU = 0x007B
+WM_LBUTTONDBLCLK = 0x0203
+WM_RBUTTONUP = 0x0205
+WM_APP = 0x8000
+TRAY_CALLBACK_MESSAGE = WM_APP + 20
+
+NIM_ADD = 0x00000000
+NIM_DELETE = 0x00000002
+NIF_MESSAGE = 0x00000001
+NIF_ICON = 0x00000002
+NIF_TIP = 0x00000004
+
+MF_STRING = 0x00000000
+MF_SEPARATOR = 0x00000800
+TPM_RIGHTBUTTON = 0x0002
+TPM_RETURNCMD = 0x0100
+TPM_NONOTIFY = 0x0080
+
+TRAY_COMMAND_ADD = 1001
+TRAY_COMMAND_SETTINGS = 1002
+TRAY_COMMAND_EXIT = 1003
+IDI_APPLICATION = 32512
+
 
 class Point(ctypes.Structure):
     _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
@@ -74,6 +96,61 @@ class MonitorInfo(ctypes.Structure):
     ]
 
 
+class Guid(ctypes.Structure):
+    _fields_ = [
+        ("Data1", wintypes.DWORD),
+        ("Data2", wintypes.WORD),
+        ("Data3", wintypes.WORD),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+
+class NotifyIconData(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("hWnd", wintypes.HWND),
+        ("uID", wintypes.UINT),
+        ("uFlags", wintypes.UINT),
+        ("uCallbackMessage", wintypes.UINT),
+        ("hIcon", wintypes.HICON),
+        ("szTip", wintypes.WCHAR * 128),
+        ("dwState", wintypes.DWORD),
+        ("dwStateMask", wintypes.DWORD),
+        ("szInfo", wintypes.WCHAR * 256),
+        ("uTimeoutOrVersion", wintypes.UINT),
+        ("szInfoTitle", wintypes.WCHAR * 64),
+        ("dwInfoFlags", wintypes.DWORD),
+        ("guidItem", Guid),
+        ("hBalloonIcon", wintypes.HICON),
+    ]
+
+
+WindowProcedure = ctypes.WINFUNCTYPE(
+    ctypes.c_ssize_t,
+    wintypes.HWND,
+    wintypes.UINT,
+    wintypes.WPARAM,
+    wintypes.LPARAM,
+)
+
+
+class WindowClassEx(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.UINT),
+        ("style", wintypes.UINT),
+        ("lpfnWndProc", WindowProcedure),
+        ("cbClsExtra", ctypes.c_int),
+        ("cbWndExtra", ctypes.c_int),
+        ("hInstance", wintypes.HINSTANCE),
+        ("hIcon", wintypes.HICON),
+        ("hCursor", wintypes.HANDLE),
+        ("hbrBackground", wintypes.HANDLE),
+        ("lpszMenuName", wintypes.LPCWSTR),
+        ("lpszClassName", wintypes.LPCWSTR),
+        ("hIconSm", wintypes.HICON),
+    ]
+
+
 def _enable_dpi_awareness() -> None:
     """Keep geometry and text crisp on scaled Windows displays."""
     try:
@@ -88,6 +165,8 @@ def _enable_dpi_awareness() -> None:
 _enable_dpi_awareness()
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
+shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 _pointer_bits = ctypes.sizeof(ctypes.c_void_p) * 8
 
 if _pointer_bits == 64:
@@ -120,6 +199,77 @@ user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MonitorInfo)]
 user32.GetMonitorInfoW.restype = wintypes.BOOL
 user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(Rect)]
 user32.GetWindowRect.restype = wintypes.BOOL
+user32.RegisterClassExW.argtypes = [ctypes.POINTER(WindowClassEx)]
+user32.RegisterClassExW.restype = wintypes.ATOM
+user32.CreateWindowExW.argtypes = [
+    wintypes.DWORD,
+    wintypes.LPCWSTR,
+    wintypes.LPCWSTR,
+    wintypes.DWORD,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    wintypes.HWND,
+    wintypes.HMENU,
+    wintypes.HINSTANCE,
+    wintypes.LPVOID,
+]
+user32.CreateWindowExW.restype = wintypes.HWND
+user32.DefWindowProcW.argtypes = [
+    wintypes.HWND,
+    wintypes.UINT,
+    wintypes.WPARAM,
+    wintypes.LPARAM,
+]
+user32.DefWindowProcW.restype = ctypes.c_ssize_t
+user32.DestroyWindow.argtypes = [wintypes.HWND]
+user32.DestroyWindow.restype = wintypes.BOOL
+user32.UnregisterClassW.argtypes = [wintypes.LPCWSTR, wintypes.HINSTANCE]
+user32.UnregisterClassW.restype = wintypes.BOOL
+user32.LoadIconW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR]
+user32.LoadIconW.restype = wintypes.HICON
+user32.CreatePopupMenu.restype = wintypes.HMENU
+user32.AppendMenuW.argtypes = [
+    wintypes.HMENU,
+    wintypes.UINT,
+    ctypes.c_size_t,
+    wintypes.LPCWSTR,
+]
+user32.AppendMenuW.restype = wintypes.BOOL
+user32.TrackPopupMenu.argtypes = [
+    wintypes.HMENU,
+    wintypes.UINT,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    wintypes.HWND,
+    wintypes.LPVOID,
+]
+user32.TrackPopupMenu.restype = wintypes.UINT
+user32.DestroyMenu.argtypes = [wintypes.HMENU]
+user32.DestroyMenu.restype = wintypes.BOOL
+user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+user32.SetForegroundWindow.restype = wintypes.BOOL
+user32.PostMessageW.argtypes = [
+    wintypes.HWND,
+    wintypes.UINT,
+    wintypes.WPARAM,
+    wintypes.LPARAM,
+]
+user32.PostMessageW.restype = wintypes.BOOL
+user32.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
+user32.RegisterWindowMessageW.restype = wintypes.UINT
+user32.GetCursorPos.argtypes = [ctypes.POINTER(Point)]
+user32.GetCursorPos.restype = wintypes.BOOL
+
+kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+kernel32.GetModuleHandleW.restype = wintypes.HINSTANCE
+shell32.Shell_NotifyIconW.argtypes = [
+    wintypes.DWORD,
+    ctypes.POINTER(NotifyIconData),
+]
+shell32.Shell_NotifyIconW.restype = wintypes.BOOL
 
 HWND_TOPMOST = wintypes.HWND(-1)
 
@@ -207,14 +357,184 @@ def _clamp(value: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(value, max(minimum, maximum)))
 
 
+class SystemTrayIcon:
+    def __init__(
+        self,
+        root: tk.Misc,
+        *,
+        on_add: Callable[[], None],
+        on_settings: Callable[[], None],
+        on_exit: Callable[[], None],
+        show_icon: bool = True,
+    ) -> None:
+        self.root = root
+        self.on_add = on_add
+        self.on_settings = on_settings
+        self.on_exit = on_exit
+        self.show_icon = show_icon
+        self._cleaned = False
+        self._icon_added = False
+        self._instance_handle = kernel32.GetModuleHandleW(None)
+        self._class_name = f"DesktopToolsTray_{id(self):x}"
+        self._window_proc_callback = WindowProcedure(self._window_proc)
+        self._taskbar_created_message = user32.RegisterWindowMessageW(
+            "TaskbarCreated"
+        )
+
+        icon_resource = ctypes.cast(
+            ctypes.c_void_p(IDI_APPLICATION),
+            wintypes.LPCWSTR,
+        )
+        self._icon_handle = user32.LoadIconW(None, icon_resource)
+
+        window_class = WindowClassEx()
+        window_class.cbSize = ctypes.sizeof(WindowClassEx)
+        window_class.lpfnWndProc = self._window_proc_callback
+        window_class.hInstance = self._instance_handle
+        window_class.hIcon = self._icon_handle
+        window_class.hIconSm = self._icon_handle
+        window_class.lpszClassName = self._class_name
+
+        self._class_atom = user32.RegisterClassExW(ctypes.byref(window_class))
+        if not self._class_atom:
+            raise ctypes.WinError(ctypes.get_last_error())
+
+        self.hwnd = user32.CreateWindowExW(
+            0,
+            self._class_name,
+            APP_TITLE,
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            self._instance_handle,
+            None,
+        )
+        if not self.hwnd:
+            user32.UnregisterClassW(self._class_name, self._instance_handle)
+            raise ctypes.WinError(ctypes.get_last_error())
+
+        self._notify_data = NotifyIconData()
+        self._notify_data.cbSize = ctypes.sizeof(NotifyIconData)
+        self._notify_data.hWnd = self.hwnd
+        self._notify_data.uID = 1
+        self._notify_data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
+        self._notify_data.uCallbackMessage = TRAY_CALLBACK_MESSAGE
+        self._notify_data.hIcon = self._icon_handle
+        self._notify_data.szTip = "DesktopTools 自由窗口"
+
+        if show_icon:
+            self._add_icon()
+
+    def _add_icon(self) -> None:
+        if not shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self._notify_data)):
+            raise RuntimeError("无法创建系统托盘图标")
+        self._icon_added = True
+
+    def _window_proc(
+        self,
+        hwnd: int,
+        message: int,
+        w_param: int,
+        l_param: int,
+    ) -> int:
+        if message == self._taskbar_created_message and self.show_icon:
+            try:
+                self._add_icon()
+            except RuntimeError:
+                pass
+            return 0
+
+        if message == TRAY_CALLBACK_MESSAGE:
+            mouse_message = int(l_param) & 0xFFFFFFFF
+            if mouse_message in (WM_RBUTTONUP, WM_CONTEXTMENU):
+                self._show_context_menu()
+                return 0
+            if mouse_message == WM_LBUTTONDBLCLK:
+                self._schedule(self.on_add)
+                return 0
+
+        if message == WM_DESTROY:
+            return 0
+
+        return int(user32.DefWindowProcW(hwnd, message, w_param, l_param))
+
+    def _show_context_menu(self) -> None:
+        menu = user32.CreatePopupMenu()
+        if not menu:
+            return
+        try:
+            user32.AppendMenuW(menu, MF_STRING, TRAY_COMMAND_ADD, "添加自由窗口")
+            user32.AppendMenuW(menu, MF_STRING, TRAY_COMMAND_SETTINGS, "设置")
+            user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
+            user32.AppendMenuW(menu, MF_STRING, TRAY_COMMAND_EXIT, "退出")
+
+            cursor = Point()
+            user32.GetCursorPos(ctypes.byref(cursor))
+            user32.SetForegroundWindow(self.hwnd)
+            command = user32.TrackPopupMenu(
+                menu,
+                TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+                cursor.x,
+                cursor.y,
+                0,
+                self.hwnd,
+                None,
+            )
+            user32.PostMessageW(self.hwnd, WM_NULL, 0, 0)
+        finally:
+            user32.DestroyMenu(menu)
+
+        actions = {
+            TRAY_COMMAND_ADD: self.on_add,
+            TRAY_COMMAND_SETTINGS: self.on_settings,
+            TRAY_COMMAND_EXIT: self.on_exit,
+        }
+        action = actions.get(command)
+        if action is not None:
+            self._schedule(action)
+
+    def _schedule(self, action: Callable[[], None]) -> None:
+        try:
+            self.root.after(0, action)
+        except tk.TclError:
+            pass
+
+    def cleanup(self) -> None:
+        if self._cleaned:
+            return
+        self._cleaned = True
+        if self._icon_added:
+            shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(self._notify_data))
+            self._icon_added = False
+        if self.hwnd:
+            user32.DestroyWindow(self.hwnd)
+            self.hwnd = None
+        if self._class_atom:
+            user32.UnregisterClassW(self._class_name, self._instance_handle)
+            self._class_atom = 0
+
+
 class OverlayApp:
     def __init__(
         self,
         *,
         visible: bool = True,
         initial_position: tuple[int, int] | None = None,
+        master: tk.Misc | None = None,
+        on_close: Callable[["OverlayApp"], None] | None = None,
+        opacity_percent: tk.IntVar | None = None,
+        edge_collapse_enabled: tk.BooleanVar | None = None,
+        restore_margin: tk.IntVar | None = None,
+        instance_number: int = 1,
     ) -> None:
         self.visible = visible
+        self.on_close = on_close
+        self.instance_number = instance_number
+        self._closed = False
         self.locked = False
         self.collapsed = False
         self.animating = False
@@ -224,21 +544,25 @@ class OverlayApp:
         self._ball_geometry: tuple[int, int, int, int] | None = None
         self._dock_edge: str | None = None
         self._sync_scheduled = False
-        self.settings_window: tk.Toplevel | None = None
-
-        self.root = tk.Tk()
+        self.root = tk.Tk() if master is None else tk.Toplevel(master)
         if not visible:
             self.root.withdraw()
 
-        self.opacity_percent = tk.IntVar(master=self.root, value=86)
-        self.edge_collapse_enabled = tk.BooleanVar(master=self.root, value=True)
-        self.restore_margin = tk.IntVar(master=self.root, value=RESTORE_MARGIN)
+        self.opacity_percent = opacity_percent or tk.IntVar(master=self.root, value=86)
+        self.edge_collapse_enabled = edge_collapse_enabled or tk.BooleanVar(
+            master=self.root,
+            value=True,
+        )
+        self.restore_margin = restore_margin or tk.IntVar(
+            master=self.root,
+            value=RESTORE_MARGIN,
+        )
 
-        self.root.title(APP_TITLE)
+        self.root.title(f"{APP_TITLE} #{instance_number}")
         self.root.overrideredirect(True)
         self.root.configure(bg=BG_OUTER)
         self.root.attributes("-topmost", True)
-        self.root.attributes("-alpha", 0.86)
+        self.root.attributes("-alpha", self.opacity_percent.get() / 100)
         self.root.minsize(MIN_WIDTH, MIN_HEIGHT)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
@@ -283,7 +607,7 @@ class OverlayApp:
 
         self.title_label = tk.Label(
             self.title_bar,
-            text="自由窗口",
+            text=f"自由窗口 #{self.instance_number}",
             bg=BG_TITLE,
             fg=TEXT,
             font=("Microsoft YaHei UI", 10, "bold"),
@@ -320,44 +644,6 @@ class OverlayApp:
         )
         lock_gap.pack(side="right", fill="y")
         lock_gap.pack_propagate(False)
-
-        self.settings_button = tk.Button(
-            self.title_bar,
-            text="设置",
-            command=self.open_settings,
-            bg=BG_TITLE,
-            fg=TEXT_MUTED,
-            activebackground="#343A46",
-            activeforeground=TEXT,
-            disabledforeground="#646B78",
-            relief="flat",
-            bd=0,
-            highlightthickness=0,
-            font=("Microsoft YaHei UI", 9),
-            cursor="hand2",
-            width=6,
-            takefocus=False,
-        )
-        self.settings_button.pack(side="right", fill="y")
-
-        self.add_button = tk.Button(
-            self.title_bar,
-            text="＋ 添加",
-            command=self.launch_new_instance,
-            bg=BG_TITLE,
-            fg=TEXT_MUTED,
-            activebackground="#343A46",
-            activeforeground=TEXT,
-            disabledforeground="#646B78",
-            relief="flat",
-            bd=0,
-            highlightthickness=0,
-            font=("Microsoft YaHei UI", 9),
-            cursor="hand2",
-            width=7,
-            takefocus=False,
-        )
-        self.add_button.pack(side="right", fill="y")
 
         for widget in (self.title_bar, grip, self.title_label, lock_gap):
             widget.bind("<ButtonPress-1>", self._begin_drag)
@@ -506,240 +792,11 @@ class OverlayApp:
             outline=ACCENT,
         )
 
-    def open_settings(self) -> None:
-        if self.settings_window is not None and self.settings_window.winfo_exists():
-            if self.visible:
-                self.settings_window.deiconify()
-                self.settings_window.attributes("-topmost", True)
-                self.settings_window.lift()
-                self.settings_window.focus_force()
-            return
-
-        window = tk.Toplevel(self.root)
-        self.settings_window = window
-        window.title("自由窗口设置")
-        window.configure(bg=BG_BODY)
-        window.resizable(False, False)
-        window.attributes("-topmost", True)
-        window.transient(self.root)
-        window.protocol("WM_DELETE_WINDOW", self._close_settings)
-
-        title = tk.Label(
-            window,
-            text="窗口设置",
-            bg=BG_BODY,
-            fg=TEXT,
-            font=("Microsoft YaHei UI", 13, "bold"),
-            anchor="w",
-        )
-        title.pack(fill="x", padx=22, pady=(20, 14))
-
-        opacity_row = tk.Frame(window, bg=BG_BODY)
-        opacity_row.pack(fill="x", padx=22)
-        tk.Label(
-            opacity_row,
-            text="窗口透明度",
-            bg=BG_BODY,
-            fg=TEXT,
-            font=("Microsoft YaHei UI", 10),
-        ).pack(side="left")
-        self.opacity_value_label = tk.Label(
-            opacity_row,
-            text=f"{self.opacity_percent.get()}%",
-            bg=BG_BODY,
-            fg=ACCENT,
-            font=("Segoe UI", 10, "bold"),
-        )
-        self.opacity_value_label.pack(side="right")
-
-        opacity_scale = tk.Scale(
-            window,
-            from_=55,
-            to=100,
-            orient="horizontal",
-            variable=self.opacity_percent,
-            command=self._on_opacity_changed,
-            bg=BG_BODY,
-            fg=TEXT_MUTED,
-            activebackground=ACCENT,
-            troughcolor=BG_PANEL,
-            highlightthickness=0,
-            bd=0,
-            showvalue=False,
-            length=326,
-        )
-        opacity_scale.pack(fill="x", padx=20, pady=(2, 12))
-
-        edge_toggle = tk.Checkbutton(
-            window,
-            text="拖到屏幕边缘时收起为小球",
-            variable=self.edge_collapse_enabled,
-            bg=BG_BODY,
-            fg=TEXT,
-            activebackground=BG_BODY,
-            activeforeground=TEXT,
-            selectcolor=BG_PANEL,
-            font=("Microsoft YaHei UI", 10),
-            anchor="w",
-            highlightthickness=0,
-        )
-        edge_toggle.pack(fill="x", padx=18, pady=(0, 12))
-
-        margin_row = tk.Frame(window, bg=BG_BODY)
-        margin_row.pack(fill="x", padx=22)
-        tk.Label(
-            margin_row,
-            text="展开后距停靠边",
-            bg=BG_BODY,
-            fg=TEXT,
-            font=("Microsoft YaHei UI", 10),
-        ).pack(side="left")
-        tk.Label(
-            margin_row,
-            text="px",
-            bg=BG_BODY,
-            fg=TEXT_MUTED,
-            font=("Segoe UI", 9),
-        ).pack(side="right", padx=(5, 0))
-        margin_input = tk.Spinbox(
-            margin_row,
-            from_=0,
-            to=80,
-            textvariable=self.restore_margin,
-            width=5,
-            justify="center",
-            bg=BG_PANEL,
-            fg=TEXT,
-            buttonbackground=BG_TITLE,
-            insertbackground=TEXT,
-            relief="flat",
-            font=("Segoe UI", 10),
-        )
-        margin_input.pack(side="right")
-
-        note = tk.Label(
-            window,
-            text="设置仅对当前实例有效，关闭后不会写入本地配置文件。",
-            bg=BG_BODY,
-            fg=TEXT_MUTED,
-            font=("Microsoft YaHei UI", 8),
-            anchor="w",
-        )
-        note.pack(fill="x", padx=22, pady=(16, 12))
-
-        actions = tk.Frame(window, bg=BG_BODY)
-        actions.pack(fill="x", padx=22, pady=(0, 18))
-        tk.Button(
-            actions,
-            text="恢复默认",
-            command=self._reset_settings,
-            bg=BG_PANEL,
-            fg=TEXT,
-            activebackground="#3A414E",
-            activeforeground=TEXT,
-            relief="flat",
-            bd=0,
-            font=("Microsoft YaHei UI", 9),
-            padx=14,
-            pady=6,
-            cursor="hand2",
-        ).pack(side="left")
-        tk.Button(
-            actions,
-            text="关闭",
-            command=self._close_settings,
-            bg=ACCENT,
-            fg="#102219",
-            activebackground=ACCENT_HOVER,
-            activeforeground="#102219",
-            relief="flat",
-            bd=0,
-            font=("Microsoft YaHei UI", 9, "bold"),
-            padx=18,
-            pady=6,
-            cursor="hand2",
-        ).pack(side="right")
-
-        settings_width = 380
-        settings_height = 310
-        x = self.root.winfo_x() + (self.root.winfo_width() - settings_width) // 2
-        y = self.root.winfo_y() + (self.root.winfo_height() - settings_height) // 2
-        _monitor_area, work_area = _monitor_areas_at(x, y)
-        left, top, right, bottom = work_area
-        x = _clamp(x, left + RESTORE_MARGIN, right - settings_width - RESTORE_MARGIN)
-        y = _clamp(y, top + RESTORE_MARGIN, bottom - settings_height - RESTORE_MARGIN)
-        _set_absolute_geometry(
-            window,
-            width=settings_width,
-            height=settings_height,
-            x=x,
-            y=y,
-        )
-        if self.visible:
-            window.lift()
-            window.focus_force()
-        else:
-            window.withdraw()
-
-    def _on_opacity_changed(self, value: str) -> None:
-        percent = _clamp(round(float(value)), 55, 100)
-        self.opacity_percent.set(percent)
-        self.root.attributes("-alpha", percent / 100)
-        if hasattr(self, "opacity_value_label"):
-            self.opacity_value_label.configure(text=f"{percent}%")
-
     def _restore_margin_pixels(self) -> int:
         try:
             return _clamp(int(self.restore_margin.get()), 0, 80)
         except (tk.TclError, ValueError):
             return RESTORE_MARGIN
-
-    def _reset_settings(self) -> None:
-        self.opacity_percent.set(86)
-        self.edge_collapse_enabled.set(True)
-        self.restore_margin.set(RESTORE_MARGIN)
-        self._on_opacity_changed("86")
-
-    def _close_settings(self) -> None:
-        if self.settings_window is None:
-            return
-        try:
-            if self.settings_window.winfo_exists():
-                self.settings_window.destroy()
-        except tk.TclError:
-            pass
-        self.settings_window = None
-
-    def _new_instance_command(self) -> list[str]:
-        new_x = self.root.winfo_x() + 36
-        new_y = self.root.winfo_y() + 36
-        if getattr(sys, "frozen", False):
-            command = [sys.executable]
-        else:
-            script_path = Path(__file__).resolve()
-            pythonw_path = Path(sys.executable).with_name("pythonw.exe")
-            executable = pythonw_path if pythonw_path.exists() else Path(sys.executable)
-            command = [str(executable), str(script_path)]
-        return [*command, "--position", str(new_x), str(new_y)]
-
-    def launch_new_instance(self) -> None:
-        command = self._new_instance_command()
-        try:
-            subprocess.Popen(
-                command,
-                cwd=str(Path(__file__).resolve().parent),
-                close_fds=True,
-                creationflags=(
-                    subprocess.DETACHED_PROCESS
-                    | subprocess.CREATE_NEW_PROCESS_GROUP
-                ),
-            )
-        except OSError as error:
-            messagebox.showerror(
-                "无法添加窗口",
-                f"启动新的自由窗口失败：\n{error}",
-                parent=self.root,
-            )
 
     def _place_initial_window(
         self,
@@ -885,7 +942,6 @@ class OverlayApp:
         self._restore_geometry = start
         self._dock_edge = dock_edge
         self.animating = True
-        self._close_settings()
         self.lock_window.withdraw()
         self.root.minsize(1, 1)
 
@@ -1073,9 +1129,6 @@ class OverlayApp:
     def set_locked(self, locked: bool) -> None:
         self.locked = locked
 
-        if locked:
-            self._close_settings()
-
         hwnd = _top_level_handle(self.root)
         style = int(_get_window_long(wintypes.HWND(hwnd), GWL_EXSTYLE))
         if locked:
@@ -1110,8 +1163,6 @@ class OverlayApp:
                 text="现在可以直接点击窗口后方的内容\n点击右上角“解锁”恢复窗口操作"
             )
             self.close_button.configure(state="disabled", cursor="arrow")
-            self.settings_button.configure(state="disabled", cursor="arrow")
-            self.add_button.configure(state="disabled", cursor="arrow")
             self.resize_grip.configure(cursor="arrow")
             self.title_bar.configure(cursor="arrow")
             self.title_label.configure(cursor="arrow")
@@ -1128,8 +1179,6 @@ class OverlayApp:
                 text="拖动顶部栏移动，拖到屏幕边缘可收起\n点击“锁定”后，鼠标操作会穿透到窗口后方"
             )
             self.close_button.configure(state="normal", cursor="hand2")
-            self.settings_button.configure(state="normal", cursor="hand2")
-            self.add_button.configure(state="normal", cursor="hand2")
             self.resize_grip.configure(cursor="size_nw_se")
             self.title_bar.configure(cursor="fleur")
             self.title_label.configure(cursor="fleur")
@@ -1146,7 +1195,9 @@ class OverlayApp:
         return bool(style & WS_EX_TRANSPARENT and style & WS_EX_NOACTIVATE)
 
     def close(self) -> None:
-        self._close_settings()
+        if self._closed:
+            return
+        self._closed = True
         try:
             if self.lock_window.winfo_exists():
                 self.lock_window.destroy()
@@ -1157,7 +1208,324 @@ class OverlayApp:
                 self.ball_window.destroy()
         except (AttributeError, tk.TclError):
             pass
-        self.root.destroy()
+        try:
+            self.root.destroy()
+        finally:
+            callback = self.on_close
+            self.on_close = None
+            if callback is not None:
+                callback(self)
+
+    def apply_shared_settings(self) -> None:
+        if self._closed:
+            return
+        self.root.attributes("-alpha", self.opacity_percent.get() / 100)
+
+    def run(self) -> None:
+        self.root.mainloop()
+
+
+class DesktopManager:
+    def __init__(
+        self,
+        *,
+        tray_enabled: bool = True,
+        visible: bool = True,
+        create_initial_window: bool = True,
+        initial_position: tuple[int, int] | None = None,
+    ) -> None:
+        self.visible = visible
+        self._exiting = False
+        self._next_instance_number = 1
+        self.windows: list[OverlayApp] = []
+        self.settings_window: tk.Toplevel | None = None
+
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.root.title(APP_TITLE)
+        self.root.protocol("WM_DELETE_WINDOW", self.exit_app)
+
+        self.opacity_percent = tk.IntVar(master=self.root, value=86)
+        self.edge_collapse_enabled = tk.BooleanVar(master=self.root, value=True)
+        self.restore_margin = tk.IntVar(master=self.root, value=RESTORE_MARGIN)
+
+        self.tray = SystemTrayIcon(
+            self.root,
+            on_add=self.add_window,
+            on_settings=self.open_settings,
+            on_exit=self.exit_app,
+            show_icon=tray_enabled,
+        )
+
+        if create_initial_window:
+            self.add_window(initial_position=initial_position)
+
+    def add_window(
+        self,
+        initial_position: tuple[int, int] | None = None,
+    ) -> OverlayApp:
+        if initial_position is None and self.windows:
+            previous = self.windows[-1]
+            if previous.collapsed and previous._ball_geometry is not None:
+                previous_x = previous._ball_geometry[2]
+                previous_y = previous._ball_geometry[3]
+            else:
+                previous_x = previous.root.winfo_x()
+                previous_y = previous.root.winfo_y()
+            initial_position = previous_x + 36, previous_y + 36
+
+        window = OverlayApp(
+            visible=self.visible,
+            initial_position=initial_position,
+            master=self.root,
+            on_close=self._on_window_closed,
+            opacity_percent=self.opacity_percent,
+            edge_collapse_enabled=self.edge_collapse_enabled,
+            restore_margin=self.restore_margin,
+            instance_number=self._next_instance_number,
+        )
+        self._next_instance_number += 1
+        self.windows.append(window)
+        self._update_instance_count()
+        return window
+
+    def _on_window_closed(self, window: OverlayApp) -> None:
+        if window in self.windows:
+            self.windows.remove(window)
+        self._update_instance_count()
+
+    def open_settings(self) -> None:
+        if self.settings_window is not None and self.settings_window.winfo_exists():
+            if self.visible:
+                self.settings_window.deiconify()
+                self.settings_window.attributes("-topmost", True)
+                self.settings_window.lift()
+                self.settings_window.focus_force()
+            return
+
+        window = tk.Toplevel(self.root)
+        self.settings_window = window
+        if not self.visible:
+            window.withdraw()
+        window.title("DesktopTools 设置")
+        window.configure(bg=BG_BODY)
+        window.resizable(False, False)
+        window.attributes("-topmost", True)
+        try:
+            window.attributes("-toolwindow", True)
+        except tk.TclError:
+            pass
+        window.protocol("WM_DELETE_WINDOW", self.close_settings)
+
+        tk.Label(
+            window,
+            text="DesktopTools 设置",
+            bg=BG_BODY,
+            fg=TEXT,
+            font=("Microsoft YaHei UI", 13, "bold"),
+            anchor="w",
+        ).pack(fill="x", padx=22, pady=(20, 6))
+
+        self.instance_count_label = tk.Label(
+            window,
+            text="",
+            bg=BG_BODY,
+            fg=TEXT_MUTED,
+            font=("Microsoft YaHei UI", 9),
+            anchor="w",
+        )
+        self.instance_count_label.pack(fill="x", padx=22, pady=(0, 14))
+
+        opacity_row = tk.Frame(window, bg=BG_BODY)
+        opacity_row.pack(fill="x", padx=22)
+        tk.Label(
+            opacity_row,
+            text="所有自由窗口的透明度",
+            bg=BG_BODY,
+            fg=TEXT,
+            font=("Microsoft YaHei UI", 10),
+        ).pack(side="left")
+        self.manager_opacity_value = tk.Label(
+            opacity_row,
+            text=f"{self.opacity_percent.get()}%",
+            bg=BG_BODY,
+            fg=ACCENT,
+            font=("Segoe UI", 10, "bold"),
+        )
+        self.manager_opacity_value.pack(side="right")
+
+        tk.Scale(
+            window,
+            from_=55,
+            to=100,
+            orient="horizontal",
+            variable=self.opacity_percent,
+            command=self._on_opacity_changed,
+            bg=BG_BODY,
+            fg=TEXT_MUTED,
+            activebackground=ACCENT,
+            troughcolor=BG_PANEL,
+            highlightthickness=0,
+            bd=0,
+            showvalue=False,
+            length=326,
+        ).pack(fill="x", padx=20, pady=(2, 12))
+
+        tk.Checkbutton(
+            window,
+            text="拖到屏幕边缘时收起为小球",
+            variable=self.edge_collapse_enabled,
+            bg=BG_BODY,
+            fg=TEXT,
+            activebackground=BG_BODY,
+            activeforeground=TEXT,
+            selectcolor=BG_PANEL,
+            font=("Microsoft YaHei UI", 10),
+            anchor="w",
+            highlightthickness=0,
+        ).pack(fill="x", padx=18, pady=(0, 12))
+
+        margin_row = tk.Frame(window, bg=BG_BODY)
+        margin_row.pack(fill="x", padx=22)
+        tk.Label(
+            margin_row,
+            text="展开后距停靠边",
+            bg=BG_BODY,
+            fg=TEXT,
+            font=("Microsoft YaHei UI", 10),
+        ).pack(side="left")
+        tk.Label(
+            margin_row,
+            text="px",
+            bg=BG_BODY,
+            fg=TEXT_MUTED,
+            font=("Segoe UI", 9),
+        ).pack(side="right", padx=(5, 0))
+        tk.Spinbox(
+            margin_row,
+            from_=0,
+            to=80,
+            textvariable=self.restore_margin,
+            width=5,
+            justify="center",
+            bg=BG_PANEL,
+            fg=TEXT,
+            buttonbackground=BG_TITLE,
+            insertbackground=TEXT,
+            relief="flat",
+            font=("Segoe UI", 10),
+        ).pack(side="right")
+
+        tk.Label(
+            window,
+            text="设置在后台进程退出前有效，并立即应用到全部实例。",
+            bg=BG_BODY,
+            fg=TEXT_MUTED,
+            font=("Microsoft YaHei UI", 8),
+            anchor="w",
+        ).pack(fill="x", padx=22, pady=(16, 12))
+
+        actions = tk.Frame(window, bg=BG_BODY)
+        actions.pack(fill="x", padx=22, pady=(0, 18))
+        tk.Button(
+            actions,
+            text="恢复默认",
+            command=self.reset_settings,
+            bg=BG_PANEL,
+            fg=TEXT,
+            activebackground="#3A414E",
+            activeforeground=TEXT,
+            relief="flat",
+            bd=0,
+            font=("Microsoft YaHei UI", 9),
+            padx=14,
+            pady=6,
+            cursor="hand2",
+        ).pack(side="left")
+        tk.Button(
+            actions,
+            text="关闭",
+            command=self.close_settings,
+            bg=ACCENT,
+            fg="#102219",
+            activebackground=ACCENT_HOVER,
+            activeforeground="#102219",
+            relief="flat",
+            bd=0,
+            font=("Microsoft YaHei UI", 9, "bold"),
+            padx=18,
+            pady=6,
+            cursor="hand2",
+        ).pack(side="right")
+
+        settings_width = 400
+        settings_height = 330
+        cursor = Point()
+        user32.GetCursorPos(ctypes.byref(cursor))
+        _monitor_area, work_area = _monitor_areas_at(cursor.x, cursor.y)
+        left, top, right, bottom = work_area
+        x = left + max(0, (right - left - settings_width) // 2)
+        y = top + max(0, (bottom - top - settings_height) // 2)
+        _set_absolute_geometry(
+            window,
+            width=settings_width,
+            height=settings_height,
+            x=x,
+            y=y,
+        )
+        self._update_instance_count()
+        if self.visible:
+            window.deiconify()
+            window.lift()
+            window.focus_force()
+
+    def _on_opacity_changed(self, value: str) -> None:
+        percent = _clamp(round(float(value)), 55, 100)
+        self.opacity_percent.set(percent)
+        if hasattr(self, "manager_opacity_value"):
+            self.manager_opacity_value.configure(text=f"{percent}%")
+        for window in tuple(self.windows):
+            window.apply_shared_settings()
+
+    def reset_settings(self) -> None:
+        self.opacity_percent.set(86)
+        self.edge_collapse_enabled.set(True)
+        self.restore_margin.set(RESTORE_MARGIN)
+        self._on_opacity_changed("86")
+
+    def close_settings(self) -> None:
+        if self.settings_window is None:
+            return
+        try:
+            if self.settings_window.winfo_exists():
+                self.settings_window.destroy()
+        except tk.TclError:
+            pass
+        self.settings_window = None
+
+    def _update_instance_count(self) -> None:
+        if hasattr(self, "instance_count_label"):
+            try:
+                self.instance_count_label.configure(
+                    text=f"当前自由窗口实例：{len(self.windows)} 个"
+                )
+            except tk.TclError:
+                pass
+
+    def exit_app(self) -> None:
+        if self._exiting:
+            return
+        self._exiting = True
+        self.close_settings()
+        for window in tuple(self.windows):
+            window.on_close = None
+            window.close()
+        self.windows.clear()
+        self.tray.cleanup()
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
 
     def run(self) -> None:
         self.root.mainloop()
@@ -1166,27 +1534,6 @@ class OverlayApp:
 def _self_test() -> None:
     app = OverlayApp(visible=False)
     app.root.update()
-
-    app.open_settings()
-    assert app.settings_window is not None
-    assert app.settings_window.winfo_exists(), "settings window was not created"
-    app._on_opacity_changed("73")
-    assert abs(float(app.root.attributes("-alpha")) - 0.73) < 0.01
-    app._reset_settings()
-    assert app.opacity_percent.get() == 86
-    app._close_settings()
-
-    new_instance_command = app._new_instance_command()
-    assert "--position" in new_instance_command
-    assert Path(new_instance_command[0]).name.lower() in {
-        "pythonw.exe",
-        Path(sys.executable).name.lower(),
-    }
-    from unittest.mock import patch
-
-    with patch.object(subprocess, "Popen") as mocked_popen:
-        app.launch_new_instance()
-        mocked_popen.assert_called_once()
     assert _position_from_arguments(["--position", "-120", "80"]) == (-120, 80)
 
     _set_absolute_geometry(
@@ -1206,17 +1553,11 @@ def _self_test() -> None:
     assert native_rect.left == -160, "negative X coordinate was mirrored"
     assert native_rect.top == -120, "negative Y coordinate was mirrored"
 
-    app.open_settings()
     app.set_locked(True)
     app.root.update()
-    assert app.settings_window is None, "settings window remained open while locked"
-    assert str(app.settings_button["state"]) == "disabled"
-    assert str(app.add_button["state"]) == "disabled"
     assert app.click_through_style_is_set(), "click-through style was not enabled"
     app.set_locked(False)
     app.root.update()
-    assert str(app.settings_button["state"]) == "normal"
-    assert str(app.add_button["state"]) == "normal"
     assert not app.click_through_style_is_set(), "click-through style was not disabled"
 
     cursor = Point()
@@ -1254,9 +1595,34 @@ def _self_test() -> None:
     assert restored_y >= work_top + RESTORE_MARGIN
     assert restored_y + restored_height <= work_bottom - RESTORE_MARGIN
     app.close()
+
+    manager = DesktopManager(
+        tray_enabled=True,
+        visible=False,
+        create_initial_window=False,
+    )
+    assert manager.tray.hwnd, "tray message window was not created"
+    first_window = manager.add_window()
+    second_window = manager.add_window()
+    assert len(manager.windows) == 2, "manager did not create two instances"
+    manager.open_settings()
+    assert manager.settings_window is not None
+    manager._on_opacity_changed("73")
+    assert abs(float(first_window.root.attributes("-alpha")) - 0.73) < 0.01
+    assert abs(float(second_window.root.attributes("-alpha")) - 0.73) < 0.01
+    manager.reset_settings()
+    manager.close_settings()
+    first_window.close()
+    assert len(manager.windows) == 1, "closing one instance stopped the manager"
+    second_window.close()
+    assert len(manager.windows) == 0, "closed instance remained registered"
+    assert manager.root.winfo_exists(), "manager stopped with the last instance"
+    manager.open_settings()
+    assert manager.settings_window is not None
+    manager.exit_app()
     print(
-        "Self-test passed: settings, new-instance launch, lock styles, "
-        "and ball collapse/restore work correctly."
+        "Self-test passed: tray manager, background lifetime, settings, "
+        "lock styles, and ball collapse/restore work correctly."
     )
 
 
@@ -1275,4 +1641,6 @@ if __name__ == "__main__":
     if "--self-test" in sys.argv:
         _self_test()
     else:
-        OverlayApp(initial_position=_position_from_arguments(sys.argv[1:])).run()
+        DesktopManager(
+            initial_position=_position_from_arguments(sys.argv[1:])
+        ).run()
