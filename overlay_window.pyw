@@ -4,6 +4,7 @@ import ctypes
 import sys
 import time
 import tkinter as tk
+from collections import deque
 from collections.abc import Callable
 from ctypes import wintypes
 
@@ -374,6 +375,7 @@ class SystemTrayIcon:
         self.show_icon = show_icon
         self._cleaned = False
         self._icon_added = False
+        self._pending_actions: deque[Callable[[], None]] = deque()
         self._instance_handle = kernel32.GetModuleHandleW(None)
         self._class_name = f"DesktopToolsTray_{id(self):x}"
         self._window_proc_callback = WindowProcedure(self._window_proc)
@@ -428,6 +430,7 @@ class SystemTrayIcon:
 
         if show_icon:
             self._add_icon()
+        self.root.after(40, self._drain_actions)
 
     def _add_icon(self) -> None:
         if not shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self._notify_data)):
@@ -488,6 +491,34 @@ class SystemTrayIcon:
         finally:
             user32.DestroyMenu(menu)
 
+        self.dispatch_command_for_test(command)
+
+    def _schedule(self, action: Callable[[], None]) -> None:
+        # Never call Tcl/Tk from inside the native WndProc callback. Doing so
+        # re-enters the interpreter while it is dispatching a Windows message
+        # and can terminate pythonw when the action creates another window.
+        self._pending_actions.append(action)
+
+    def _drain_actions(self) -> None:
+        if self._cleaned:
+            return
+        while self._pending_actions:
+            action = self._pending_actions.popleft()
+            try:
+                action()
+            except Exception as error:
+                self.root.report_callback_exception(
+                    type(error),
+                    error,
+                    error.__traceback__,
+                )
+        if not self._cleaned:
+            try:
+                self.root.after(40, self._drain_actions)
+            except tk.TclError:
+                pass
+
+    def dispatch_command_for_test(self, command: int) -> None:
         actions = {
             TRAY_COMMAND_ADD: self.on_add,
             TRAY_COMMAND_SETTINGS: self.on_settings,
@@ -496,12 +527,6 @@ class SystemTrayIcon:
         action = actions.get(command)
         if action is not None:
             self._schedule(action)
-
-    def _schedule(self, action: Callable[[], None]) -> None:
-        try:
-            self.root.after(0, action)
-        except tk.TclError:
-            pass
 
     def cleanup(self) -> None:
         if self._cleaned:
@@ -1602,10 +1627,23 @@ def _self_test() -> None:
         create_initial_window=False,
     )
     assert manager.tray.hwnd, "tray message window was not created"
-    first_window = manager.add_window()
-    second_window = manager.add_window()
+    manager.tray.dispatch_command_for_test(TRAY_COMMAND_ADD)
+    deadline = time.monotonic() + 1
+    while len(manager.windows) < 1 and time.monotonic() < deadline:
+        manager.root.update()
+        time.sleep(0.01)
+    manager.tray.dispatch_command_for_test(TRAY_COMMAND_ADD)
+    deadline = time.monotonic() + 1
+    while len(manager.windows) < 2 and time.monotonic() < deadline:
+        manager.root.update()
+        time.sleep(0.01)
     assert len(manager.windows) == 2, "manager did not create two instances"
-    manager.open_settings()
+    first_window, second_window = manager.windows
+    manager.tray.dispatch_command_for_test(TRAY_COMMAND_SETTINGS)
+    deadline = time.monotonic() + 1
+    while manager.settings_window is None and time.monotonic() < deadline:
+        manager.root.update()
+        time.sleep(0.01)
     assert manager.settings_window is not None
     manager._on_opacity_changed("73")
     assert abs(float(first_window.root.attributes("-alpha")) - 0.73) < 0.01
