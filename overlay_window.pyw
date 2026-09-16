@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import ctypes
+import json
+import math
+import os
 import sys
+import tempfile
 import time
 import tkinter as tk
 from collections import deque
 from collections.abc import Callable
 from ctypes import wintypes
+from pathlib import Path
 
 
 APP_TITLE = "DesktopTools 自由窗口"
@@ -73,6 +78,10 @@ TRAY_COMMAND_ADD = 1001
 TRAY_COMMAND_SETTINGS = 1002
 TRAY_COMMAND_EXIT = 1003
 IDI_APPLICATION = 32512
+MIIM_BITMAP = 0x00000080
+DIB_RGB_COLORS = 0
+BI_RGB = 0
+MENU_ICON_SIZE = 16
 
 
 class Point(ctypes.Structure):
@@ -126,6 +135,55 @@ class NotifyIconData(ctypes.Structure):
     ]
 
 
+class BitmapInfoHeader(ctypes.Structure):
+    _fields_ = [
+        ("biSize", wintypes.DWORD),
+        ("biWidth", wintypes.LONG),
+        ("biHeight", wintypes.LONG),
+        ("biPlanes", wintypes.WORD),
+        ("biBitCount", wintypes.WORD),
+        ("biCompression", wintypes.DWORD),
+        ("biSizeImage", wintypes.DWORD),
+        ("biXPelsPerMeter", wintypes.LONG),
+        ("biYPelsPerMeter", wintypes.LONG),
+        ("biClrUsed", wintypes.DWORD),
+        ("biClrImportant", wintypes.DWORD),
+    ]
+
+
+class RgbQuad(ctypes.Structure):
+    _fields_ = [
+        ("rgbBlue", ctypes.c_ubyte),
+        ("rgbGreen", ctypes.c_ubyte),
+        ("rgbRed", ctypes.c_ubyte),
+        ("rgbReserved", ctypes.c_ubyte),
+    ]
+
+
+class BitmapInfo(ctypes.Structure):
+    _fields_ = [
+        ("bmiHeader", BitmapInfoHeader),
+        ("bmiColors", RgbQuad * 1),
+    ]
+
+
+class MenuItemInfo(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.UINT),
+        ("fMask", wintypes.UINT),
+        ("fType", wintypes.UINT),
+        ("fState", wintypes.UINT),
+        ("wID", wintypes.UINT),
+        ("hSubMenu", wintypes.HMENU),
+        ("hbmpChecked", wintypes.HBITMAP),
+        ("hbmpUnchecked", wintypes.HBITMAP),
+        ("dwItemData", ctypes.c_size_t),
+        ("dwTypeData", wintypes.LPWSTR),
+        ("cch", wintypes.UINT),
+        ("hbmpItem", wintypes.HBITMAP),
+    ]
+
+
 WindowProcedure = ctypes.WINFUNCTYPE(
     ctypes.c_ssize_t,
     wintypes.HWND,
@@ -168,6 +226,7 @@ _enable_dpi_awareness()
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 shell32 = ctypes.WinDLL("shell32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
 _pointer_bits = ctypes.sizeof(ctypes.c_void_p) * 8
 
 if _pointer_bits == 64:
@@ -263,6 +322,13 @@ user32.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
 user32.RegisterWindowMessageW.restype = wintypes.UINT
 user32.GetCursorPos.argtypes = [ctypes.POINTER(Point)]
 user32.GetCursorPos.restype = wintypes.BOOL
+user32.SetMenuItemInfoW.argtypes = [
+    wintypes.HMENU,
+    wintypes.UINT,
+    wintypes.BOOL,
+    ctypes.POINTER(MenuItemInfo),
+]
+user32.SetMenuItemInfoW.restype = wintypes.BOOL
 
 kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
 kernel32.GetModuleHandleW.restype = wintypes.HINSTANCE
@@ -271,6 +337,17 @@ shell32.Shell_NotifyIconW.argtypes = [
     ctypes.POINTER(NotifyIconData),
 ]
 shell32.Shell_NotifyIconW.restype = wintypes.BOOL
+gdi32.CreateDIBSection.argtypes = [
+    wintypes.HDC,
+    ctypes.POINTER(BitmapInfo),
+    wintypes.UINT,
+    ctypes.POINTER(ctypes.c_void_p),
+    wintypes.HANDLE,
+    wintypes.DWORD,
+]
+gdi32.CreateDIBSection.restype = wintypes.HBITMAP
+gdi32.DeleteObject.argtypes = [wintypes.HANDLE]
+gdi32.DeleteObject.restype = wintypes.BOOL
 
 HWND_TOPMOST = wintypes.HWND(-1)
 
@@ -358,6 +435,170 @@ def _clamp(value: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(value, max(minimum, maximum)))
 
 
+def _default_settings_path() -> Path:
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        return Path(local_app_data) / "DesktopTools" / "settings.json"
+    return Path.home() / "AppData" / "Local" / "DesktopTools" / "settings.json"
+
+
+class SettingsStore:
+    DEFAULTS = {
+        "opacity_percent": 86,
+        "edge_collapse_enabled": True,
+        "restore_margin": RESTORE_MARGIN,
+    }
+
+    def __init__(self, path: Path | None = None) -> None:
+        self.path = Path(path) if path is not None else _default_settings_path()
+
+    def load(self) -> dict[str, int | bool]:
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            raw = {}
+        if not isinstance(raw, dict):
+            raw = {}
+
+        opacity = raw.get("opacity_percent")
+        if isinstance(opacity, bool) or not isinstance(opacity, (int, float)):
+            opacity = self.DEFAULTS["opacity_percent"]
+
+        edge_collapse = raw.get("edge_collapse_enabled")
+        if not isinstance(edge_collapse, bool):
+            edge_collapse = self.DEFAULTS["edge_collapse_enabled"]
+
+        restore_margin = raw.get("restore_margin")
+        if isinstance(restore_margin, bool) or not isinstance(
+            restore_margin,
+            (int, float),
+        ):
+            restore_margin = self.DEFAULTS["restore_margin"]
+
+        return {
+            "opacity_percent": _clamp(round(opacity), 55, 100),
+            "edge_collapse_enabled": edge_collapse,
+            "restore_margin": _clamp(round(restore_margin), 0, 80),
+        }
+
+    def save(self, settings: dict[str, int | bool]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": 1,
+            "opacity_percent": _clamp(int(settings["opacity_percent"]), 55, 100),
+            "edge_collapse_enabled": bool(settings["edge_collapse_enabled"]),
+            "restore_margin": _clamp(int(settings["restore_margin"]), 0, 80),
+        }
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix="settings-",
+            suffix=".tmp",
+            dir=self.path.parent,
+        )
+        temporary_path = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as file:
+                json.dump(payload, file, ensure_ascii=False, indent=2)
+                file.write("\n")
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(temporary_path, self.path)
+        except BaseException:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+
+
+def _menu_icon_color(kind: str, x: float, y: float) -> tuple[int, int, int] | None:
+    center = (MENU_ICON_SIZE - 1) / 2
+    dx = x - center
+    dy = y - center
+    radius = math.hypot(dx, dy)
+
+    if kind == "add":
+        if abs(dx) <= 1.05 and abs(dy) <= 4.1:
+            return 245, 255, 250
+        if abs(dy) <= 1.05 and abs(dx) <= 4.1:
+            return 245, 255, 250
+        if radius <= 6.65:
+            return 52, 181, 122
+        return None
+
+    if kind == "settings":
+        angle = math.atan2(dy, dx)
+        tooth = abs(math.cos(angle * 4)) >= 0.68
+        outer_radius = 7.15 if tooth else 6.1
+        if 2.25 <= radius <= outer_radius:
+            return 65, 169, 224
+        return None
+
+    if kind == "exit":
+        ring_center_y = 8.25
+        ring_dx = x - center
+        ring_dy = y - ring_center_y
+        ring_radius = math.hypot(ring_dx, ring_dy)
+        ring = abs(ring_radius - 5.0) <= 1.15 and not (
+            y < 5.3 and abs(ring_dx) < 2.25
+        )
+        stem = abs(dx) <= 1.0 and 1.3 <= y <= 7.2
+        if ring or stem:
+            return 222, 75, 89
+    return None
+
+
+def _create_menu_bitmap(kind: str) -> int:
+    bitmap_info = BitmapInfo()
+    bitmap_info.bmiHeader.biSize = ctypes.sizeof(BitmapInfoHeader)
+    bitmap_info.bmiHeader.biWidth = MENU_ICON_SIZE
+    bitmap_info.bmiHeader.biHeight = -MENU_ICON_SIZE
+    bitmap_info.bmiHeader.biPlanes = 1
+    bitmap_info.bmiHeader.biBitCount = 32
+    bitmap_info.bmiHeader.biCompression = BI_RGB
+    bits = ctypes.c_void_p()
+    bitmap = gdi32.CreateDIBSection(
+        None,
+        ctypes.byref(bitmap_info),
+        DIB_RGB_COLORS,
+        ctypes.byref(bits),
+        None,
+        0,
+    )
+    if not bitmap or not bits.value:
+        return 0
+
+    pixels = (ctypes.c_uint32 * (MENU_ICON_SIZE * MENU_ICON_SIZE)).from_address(
+        bits.value
+    )
+    samples_per_axis = 4
+    sample_count = samples_per_axis * samples_per_axis
+    for pixel_y in range(MENU_ICON_SIZE):
+        for pixel_x in range(MENU_ICON_SIZE):
+            red = green = blue = hits = 0
+            for sample_y in range(samples_per_axis):
+                for sample_x in range(samples_per_axis):
+                    color = _menu_icon_color(
+                        kind,
+                        pixel_x + (sample_x + 0.5) / samples_per_axis,
+                        pixel_y + (sample_y + 0.5) / samples_per_axis,
+                    )
+                    if color is not None:
+                        red += color[0]
+                        green += color[1]
+                        blue += color[2]
+                        hits += 1
+            if not hits:
+                continue
+            alpha = round(255 * hits / sample_count)
+            red = round(red / hits * alpha / 255)
+            green = round(green / hits * alpha / 255)
+            blue = round(blue / hits * alpha / 255)
+            pixels[pixel_y * MENU_ICON_SIZE + pixel_x] = (
+                alpha << 24 | red << 16 | green << 8 | blue
+            )
+    return int(bitmap)
+
+
 class SystemTrayIcon:
     def __init__(
         self,
@@ -375,6 +616,7 @@ class SystemTrayIcon:
         self.show_icon = show_icon
         self._cleaned = False
         self._icon_added = False
+        self._menu_bitmaps: dict[int, int] = {}
         self._pending_actions: deque[Callable[[], None]] = deque()
         self._instance_handle = kernel32.GetModuleHandleW(None)
         self._class_name = f"DesktopToolsTray_{id(self):x}"
@@ -418,6 +660,12 @@ class SystemTrayIcon:
         if not self.hwnd:
             user32.UnregisterClassW(self._class_name, self._instance_handle)
             raise ctypes.WinError(ctypes.get_last_error())
+
+        self._menu_bitmaps = {
+            TRAY_COMMAND_ADD: _create_menu_bitmap("add"),
+            TRAY_COMMAND_SETTINGS: _create_menu_bitmap("settings"),
+            TRAY_COMMAND_EXIT: _create_menu_bitmap("exit"),
+        }
 
         self._notify_data = NotifyIconData()
         self._notify_data.cbSize = ctypes.sizeof(NotifyIconData)
@@ -474,6 +722,7 @@ class SystemTrayIcon:
             user32.AppendMenuW(menu, MF_STRING, TRAY_COMMAND_SETTINGS, "设置")
             user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
             user32.AppendMenuW(menu, MF_STRING, TRAY_COMMAND_EXIT, "退出")
+            self._apply_menu_bitmaps(menu)
 
             cursor = Point()
             user32.GetCursorPos(ctypes.byref(cursor))
@@ -492,6 +741,25 @@ class SystemTrayIcon:
             user32.DestroyMenu(menu)
 
         self.dispatch_command_for_test(command)
+
+    def _apply_menu_bitmaps(self, menu: int) -> bool:
+        all_applied = True
+        for command, bitmap in self._menu_bitmaps.items():
+            if not bitmap:
+                all_applied = False
+                continue
+            item_info = MenuItemInfo()
+            item_info.cbSize = ctypes.sizeof(MenuItemInfo)
+            item_info.fMask = MIIM_BITMAP
+            item_info.hbmpItem = wintypes.HBITMAP(bitmap)
+            applied = user32.SetMenuItemInfoW(
+                menu,
+                command,
+                False,
+                ctypes.byref(item_info),
+            )
+            all_applied = bool(applied) and all_applied
+        return all_applied
 
     def _schedule(self, action: Callable[[], None]) -> None:
         # Never call Tcl/Tk from inside the native WndProc callback. Doing so
@@ -541,6 +809,10 @@ class SystemTrayIcon:
         if self._class_atom:
             user32.UnregisterClassW(self._class_name, self._instance_handle)
             self._class_atom = 0
+        for bitmap in self._menu_bitmaps.values():
+            if bitmap:
+                gdi32.DeleteObject(wintypes.HANDLE(bitmap))
+        self._menu_bitmaps.clear()
 
 
 class OverlayApp:
@@ -1258,10 +1530,13 @@ class DesktopManager:
         visible: bool = True,
         create_initial_window: bool = True,
         initial_position: tuple[int, int] | None = None,
+        settings_path: Path | None = None,
     ) -> None:
         self.visible = visible
         self._exiting = False
         self._next_instance_number = 1
+        self._settings_save_after_id: str | None = None
+        self._settings_dirty = False
         self.windows: list[OverlayApp] = []
         self.settings_window: tk.Toplevel | None = None
 
@@ -1270,9 +1545,29 @@ class DesktopManager:
         self.root.title(APP_TITLE)
         self.root.protocol("WM_DELETE_WINDOW", self.exit_app)
 
-        self.opacity_percent = tk.IntVar(master=self.root, value=86)
-        self.edge_collapse_enabled = tk.BooleanVar(master=self.root, value=True)
-        self.restore_margin = tk.IntVar(master=self.root, value=RESTORE_MARGIN)
+        self.settings_store = SettingsStore(settings_path)
+        saved_settings = self.settings_store.load()
+        self.opacity_percent = tk.IntVar(
+            master=self.root,
+            value=saved_settings["opacity_percent"],
+        )
+        self.edge_collapse_enabled = tk.BooleanVar(
+            master=self.root,
+            value=saved_settings["edge_collapse_enabled"],
+        )
+        self.restore_margin = tk.IntVar(
+            master=self.root,
+            value=saved_settings["restore_margin"],
+        )
+        for setting_variable in (
+            self.opacity_percent,
+            self.edge_collapse_enabled,
+            self.restore_margin,
+        ):
+            setting_variable.trace_add("write", self._schedule_settings_save)
+        # Write defaults on first launch and normalize older or manually edited files.
+        self._settings_dirty = True
+        self._settings_save_after_id = self.root.after(250, self._save_settings_now)
 
         self.tray = SystemTrayIcon(
             self.root,
@@ -1441,14 +1736,15 @@ class DesktopManager:
             font=("Segoe UI", 10),
         ).pack(side="right")
 
-        tk.Label(
+        self.settings_note_label = tk.Label(
             window,
-            text="设置在后台进程退出前有效，并立即应用到全部实例。",
+            text="设置会自动保存到本机，并立即应用到全部实例。",
             bg=BG_BODY,
             fg=TEXT_MUTED,
             font=("Microsoft YaHei UI", 8),
             anchor="w",
-        ).pack(fill="x", padx=22, pady=(16, 12))
+        )
+        self.settings_note_label.pack(fill="x", padx=22, pady=(16, 12))
 
         actions = tk.Frame(window, bg=BG_BODY)
         actions.pack(fill="x", padx=22, pady=(0, 18))
@@ -1512,6 +1808,72 @@ class DesktopManager:
         for window in tuple(self.windows):
             window.apply_shared_settings()
 
+    def _schedule_settings_save(self, *_trace_arguments: str) -> None:
+        if self._exiting:
+            return
+        self._settings_dirty = True
+        if self._settings_save_after_id is not None:
+            try:
+                self.root.after_cancel(self._settings_save_after_id)
+            except tk.TclError:
+                pass
+        self._settings_save_after_id = self.root.after(
+            250,
+            self._save_settings_now,
+        )
+
+    def _current_settings(self) -> dict[str, int | bool]:
+        try:
+            opacity = int(self.opacity_percent.get())
+        except (tk.TclError, ValueError):
+            opacity = int(SettingsStore.DEFAULTS["opacity_percent"])
+        try:
+            restore_margin = int(self.restore_margin.get())
+        except (tk.TclError, ValueError):
+            restore_margin = int(SettingsStore.DEFAULTS["restore_margin"])
+        try:
+            edge_collapse = bool(self.edge_collapse_enabled.get())
+        except tk.TclError:
+            edge_collapse = bool(SettingsStore.DEFAULTS["edge_collapse_enabled"])
+        return {
+            "opacity_percent": _clamp(opacity, 55, 100),
+            "edge_collapse_enabled": edge_collapse,
+            "restore_margin": _clamp(restore_margin, 0, 80),
+        }
+
+    def _save_settings_now(self) -> None:
+        pending_after = self._settings_save_after_id
+        self._settings_save_after_id = None
+        if pending_after is not None:
+            try:
+                self.root.after_cancel(pending_after)
+            except tk.TclError:
+                pass
+        if not self._settings_dirty:
+            return
+        try:
+            self.settings_store.save(self._current_settings())
+        except OSError:
+            self._settings_dirty = True
+            if hasattr(self, "settings_note_label"):
+                try:
+                    self.settings_note_label.configure(
+                        text="设置暂时无法写入磁盘；退出前会再次尝试。",
+                        fg=CLOSE_HOVER,
+                    )
+                except tk.TclError:
+                    pass
+            return
+        self._settings_dirty = False
+        if hasattr(self, "settings_note_label"):
+            try:
+                self.settings_note_label.configure(
+                    text="设置会自动保存到本机，并立即应用到全部实例。",
+                    fg=TEXT_MUTED,
+                )
+            except tk.TclError:
+                pass
+
     def reset_settings(self) -> None:
         self.opacity_percent.set(86)
         self.edge_collapse_enabled.set(True)
@@ -1519,6 +1881,7 @@ class DesktopManager:
         self._on_opacity_changed("86")
 
     def close_settings(self) -> None:
+        self._save_settings_now()
         if self.settings_window is None:
             return
         try:
@@ -1621,12 +1984,29 @@ def _self_test() -> None:
     assert restored_y + restored_height <= work_bottom - RESTORE_MARGIN
     app.close()
 
+    temporary_settings_directory = tempfile.TemporaryDirectory()
+    test_settings_path = (
+        Path(temporary_settings_directory.name) / "DesktopTools" / "settings.json"
+    )
     manager = DesktopManager(
         tray_enabled=True,
         visible=False,
         create_initial_window=False,
+        settings_path=test_settings_path,
     )
     assert manager.tray.hwnd, "tray message window was not created"
+    assert all(manager.tray._menu_bitmaps.values()), "tray menu icons were not created"
+    test_menu = user32.CreatePopupMenu()
+    assert test_menu, "test popup menu was not created"
+    try:
+        user32.AppendMenuW(test_menu, MF_STRING, TRAY_COMMAND_ADD, "添加自由窗口")
+        user32.AppendMenuW(test_menu, MF_STRING, TRAY_COMMAND_SETTINGS, "设置")
+        user32.AppendMenuW(test_menu, MF_STRING, TRAY_COMMAND_EXIT, "退出")
+        assert manager.tray._apply_menu_bitmaps(test_menu), (
+            "tray menu icons were not attached"
+        )
+    finally:
+        user32.DestroyMenu(test_menu)
     manager.tray.dispatch_command_for_test(TRAY_COMMAND_ADD)
     deadline = time.monotonic() + 1
     while len(manager.windows) < 1 and time.monotonic() < deadline:
@@ -1649,6 +2029,15 @@ def _self_test() -> None:
     assert abs(float(first_window.root.attributes("-alpha")) - 0.73) < 0.01
     assert abs(float(second_window.root.attributes("-alpha")) - 0.73) < 0.01
     manager.reset_settings()
+    assert manager.opacity_percent.get() == 86
+    manager.opacity_percent.set(77)
+    manager.edge_collapse_enabled.set(False)
+    manager.restore_margin.set(17)
+    manager._save_settings_now()
+    saved_settings = json.loads(test_settings_path.read_text(encoding="utf-8"))
+    assert saved_settings["opacity_percent"] == 77
+    assert saved_settings["edge_collapse_enabled"] is False
+    assert saved_settings["restore_margin"] == 17
     manager.close_settings()
     first_window.close()
     assert len(manager.windows) == 1, "closing one instance stopped the manager"
@@ -1658,9 +2047,21 @@ def _self_test() -> None:
     manager.open_settings()
     assert manager.settings_window is not None
     manager.exit_app()
+
+    reloaded_manager = DesktopManager(
+        tray_enabled=False,
+        visible=False,
+        create_initial_window=False,
+        settings_path=test_settings_path,
+    )
+    assert reloaded_manager.opacity_percent.get() == 77
+    assert reloaded_manager.edge_collapse_enabled.get() is False
+    assert reloaded_manager.restore_margin.get() == 17
+    reloaded_manager.exit_app()
+    temporary_settings_directory.cleanup()
     print(
-        "Self-test passed: tray manager, background lifetime, settings, "
-        "lock styles, and ball collapse/restore work correctly."
+        "Self-test passed: tray manager and icons, persistent settings, "
+        "background lifetime, lock styles, and ball collapse/restore work correctly."
     )
 
 
