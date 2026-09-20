@@ -19,7 +19,7 @@ APP_TITLE = "DesktopTools 自由窗口"
 WINDOW_WIDTH = 560
 WINDOW_HEIGHT = 320
 MIN_WIDTH = 380
-MIN_HEIGHT = 220
+MIN_HEIGHT = 280
 TITLE_HEIGHT = 48
 LOCK_WIDTH = 68
 LOCK_HEIGHT = 32
@@ -30,6 +30,15 @@ RESTORE_MARGIN = 10
 EDGE_TRIGGER_DISTANCE = 28
 ANIMATION_STEPS = 10
 ANIMATION_DELAY_MS = 14
+HOVER_POLL_MS = 90
+HOVER_MARGIN = 16
+WINDOW_MODES = ("便签", "待办", "倒计时", "时钟")
+MODE_HINTS = {
+    "便签": "把临时想法放在手边",
+    "待办": "双击事项即可切换完成状态",
+    "倒计时": "专注、休息或提醒自己换个任务",
+    "时钟": "开会或全屏工作时也能看到时间",
+}
 
 BG_OUTER = "#11141A"
 BG_TITLE = "#20242D"
@@ -48,6 +57,9 @@ TRANSPARENT_KEY = "#010203"
 GWL_EXSTYLE = -20
 WS_EX_TRANSPARENT = 0x00000020
 WS_EX_NOACTIVATE = 0x08000000
+WS_EX_LAYERED = 0x00080000
+LWA_COLORKEY = 0x00000001
+LWA_ALPHA = 0x00000002
 SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
 SWP_NOACTIVATE = 0x0010
@@ -259,6 +271,20 @@ user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MonitorInfo)]
 user32.GetMonitorInfoW.restype = wintypes.BOOL
 user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(Rect)]
 user32.GetWindowRect.restype = wintypes.BOOL
+user32.SetLayeredWindowAttributes.argtypes = [
+    wintypes.HWND,
+    wintypes.DWORD,
+    ctypes.c_ubyte,
+    wintypes.DWORD,
+]
+user32.SetLayeredWindowAttributes.restype = wintypes.BOOL
+user32.GetLayeredWindowAttributes.argtypes = [
+    wintypes.HWND,
+    ctypes.POINTER(wintypes.DWORD),
+    ctypes.POINTER(ctypes.c_ubyte),
+    ctypes.POINTER(wintypes.DWORD),
+]
+user32.GetLayeredWindowAttributes.restype = wintypes.BOOL
 user32.RegisterClassExW.argtypes = [ctypes.POINTER(WindowClassEx)]
 user32.RegisterClassExW.restype = wintypes.ATOM
 user32.CreateWindowExW.argtypes = [
@@ -409,6 +435,34 @@ def _set_absolute_geometry(
         raise ctypes.WinError(ctypes.get_last_error())
 
 
+def _colorref(color: str) -> int:
+    red = int(color[1:3], 16)
+    green = int(color[3:5], 16)
+    blue = int(color[5:7], 16)
+    return (blue << 16) | (green << 8) | red
+
+
+def _set_layered_attributes(hwnd: int, key: int, alpha: int, flags: int) -> bool:
+    """Combine uniform alpha and a background color key on one layered window.
+
+    Tk's -alpha and -transparentcolor attributes each replace the layered
+    window flags, so the two cannot be active at the same time through Tk.
+    Calling SetLayeredWindowAttributes directly keeps both at once.
+    """
+    handle = wintypes.HWND(hwnd)
+    extended_style = int(_get_window_long(handle, GWL_EXSTYLE))
+    if not extended_style & WS_EX_LAYERED:
+        _set_window_long(handle, GWL_EXSTYLE, extended_style | WS_EX_LAYERED)
+    return bool(
+        user32.SetLayeredWindowAttributes(
+            handle,
+            key,
+            _clamp(alpha, 0, 255),
+            flags,
+        )
+    )
+
+
 def _monitor_areas_at(x: int, y: int) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int]]:
     monitor = user32.MonitorFromPoint(Point(x, y), MONITOR_DEFAULTTONEAREST)
     info = MonitorInfo()
@@ -447,6 +501,7 @@ class SettingsStore:
         "opacity_percent": 86,
         "edge_collapse_enabled": True,
         "restore_margin": RESTORE_MARGIN,
+        "no_background": False,
     }
 
     def __init__(self, path: Path | None = None) -> None:
@@ -475,10 +530,15 @@ class SettingsStore:
         ):
             restore_margin = self.DEFAULTS["restore_margin"]
 
+        no_background = raw.get("no_background")
+        if not isinstance(no_background, bool):
+            no_background = self.DEFAULTS["no_background"]
+
         return {
             "opacity_percent": _clamp(round(opacity), 55, 100),
             "edge_collapse_enabled": edge_collapse,
             "restore_margin": _clamp(round(restore_margin), 0, 80),
+            "no_background": no_background,
         }
 
     def save(self, settings: dict[str, int | bool]) -> None:
@@ -488,6 +548,7 @@ class SettingsStore:
             "opacity_percent": _clamp(int(settings["opacity_percent"]), 55, 100),
             "edge_collapse_enabled": bool(settings["edge_collapse_enabled"]),
             "restore_margin": _clamp(int(settings["restore_margin"]), 0, 80),
+            "no_background": bool(settings["no_background"]),
         }
         descriptor, temporary_name = tempfile.mkstemp(
             prefix="settings-",
@@ -826,6 +887,7 @@ class OverlayApp:
         opacity_percent: tk.IntVar | None = None,
         edge_collapse_enabled: tk.BooleanVar | None = None,
         restore_margin: tk.IntVar | None = None,
+        no_background: tk.BooleanVar | None = None,
         instance_number: int = 1,
     ) -> None:
         self.visible = visible
@@ -835,12 +897,20 @@ class OverlayApp:
         self.locked = False
         self.collapsed = False
         self.animating = False
+        self._background_hidden = False
+        self._constant_styles: list[tuple[tk.Widget, dict[str, str]]] = []
+        self._stateful_styles: dict[tk.Widget, tuple[str, ...]] = {}
         self._drag_origin: tuple[int, int] | None = None
         self._resize_origin: tuple[int, int, int, int] | None = None
         self._restore_geometry: tuple[int, int, int, int] | None = None
         self._ball_geometry: tuple[int, int, int, int] | None = None
         self._dock_edge: str | None = None
         self._sync_scheduled = False
+        self.mode = WINDOW_MODES[0]
+        self.todo_items: list[tuple[str, bool]] = []
+        self._timer_remaining_seconds = 25 * 60
+        self._timer_deadline: float | None = None
+        self._tick_after_id: str | None = None
         self.root = tk.Tk() if master is None else tk.Toplevel(master)
         if not visible:
             self.root.withdraw()
@@ -853,6 +923,10 @@ class OverlayApp:
         self.restore_margin = restore_margin or tk.IntVar(
             master=self.root,
             value=RESTORE_MARGIN,
+        )
+        self.no_background = no_background or tk.BooleanVar(
+            master=self.root,
+            value=False,
         )
 
         self.root.title(f"{APP_TITLE} #{instance_number}")
@@ -872,6 +946,11 @@ class OverlayApp:
         self.root.bind("<Configure>", self._on_main_configure, add="+")
         self.root.bind("<Escape>", lambda _event: self.close())
         self.root.after_idle(self._sync_lock_window)
+        self._tick_modes()
+
+        cursor = Point()
+        user32.GetCursorPos(ctypes.byref(cursor))
+        self.update_background_for_hover(cursor.x, cursor.y)
 
     def _build_main_window(self) -> None:
         border = tk.Frame(self.root, bg=BORDER, bd=0, highlightthickness=0)
@@ -942,6 +1021,38 @@ class OverlayApp:
         lock_gap.pack(side="right", fill="y")
         lock_gap.pack_propagate(False)
 
+        self.mode_button = tk.Button(
+            self.title_bar,
+            text="便签 ▾",
+            command=self._show_mode_menu,
+            bg=BG_TITLE,
+            fg=ACCENT,
+            activebackground="#343B47",
+            activeforeground=TEXT,
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            font=("Microsoft YaHei UI", 9),
+            cursor="hand2",
+            width=9,
+            takefocus=False,
+        )
+        self.mode_button.pack(side="right", fill="y")
+        self.mode_menu = tk.Menu(
+            self.root,
+            tearoff=False,
+            bg=BG_PANEL,
+            fg=TEXT,
+            activebackground=ACCENT,
+            activeforeground="#102219",
+            relief="flat",
+        )
+        for mode in WINDOW_MODES:
+            self.mode_menu.add_command(
+                label=mode,
+                command=lambda selected=mode: self.set_mode(selected),
+            )
+
         for widget in (self.title_bar, grip, self.title_label, lock_gap):
             widget.bind("<ButtonPress-1>", self._begin_drag)
             widget.bind("<B1-Motion>", self._drag_window)
@@ -957,36 +1068,30 @@ class OverlayApp:
             highlightbackground="#3B414E",
             highlightthickness=1,
         )
-        panel.pack(fill="both", expand=True, padx=24, pady=24)
+        panel.pack(fill="both", expand=True, padx=16, pady=16)
 
         self.status_label = tk.Label(
             panel,
-            text="●  可操作",
+            text="●  便签",
             bg=BG_PANEL,
             fg=ACCENT,
             font=("Microsoft YaHei UI", 10, "bold"),
         )
-        self.status_label.pack(pady=(34, 12))
+        self.status_label.pack(pady=(10, 2))
 
         self.message_label = tk.Label(
             panel,
-            text="拖动顶部栏移动，拖到屏幕边缘可收起\n点击“锁定”后，鼠标操作会穿透到窗口后方",
+            text=MODE_HINTS["便签"],
             bg=BG_PANEL,
             fg=TEXT,
             justify="center",
-            font=("Microsoft YaHei UI", 11),
-            padx=24,
+            font=("Microsoft YaHei UI", 9),
+            padx=10,
         )
         self.message_label.pack()
 
-        hint = tk.Label(
-            panel,
-            text="窗口将始终保持在最前方",
-            bg=BG_PANEL,
-            fg=TEXT_MUTED,
-            font=("Microsoft YaHei UI", 9),
-        )
-        hint.pack(pady=(14, 0))
+        self.mode_container = tk.Frame(panel, bg=BG_PANEL)
+        self.mode_container.pack(fill="both", expand=True, padx=12, pady=(5, 10))
 
         self.resize_grip = tk.Label(
             body,
@@ -1002,6 +1107,355 @@ class OverlayApp:
         self.resize_grip.bind("<ButtonPress-1>", self._begin_resize)
         self.resize_grip.bind("<B1-Motion>", self._resize_window)
         self.resize_grip.bind("<ButtonRelease-1>", self._end_resize)
+
+        self._constant_styles = [
+            (self.root, {"bg": BG_OUTER}),
+            (border, {"bg": BORDER}),
+            (shell, {"bg": BG_BODY}),
+            (self.title_bar, {"bg": BG_TITLE}),
+            (grip, {"bg": BG_TITLE, "fg": TEXT_MUTED}),
+            (self.title_label, {"bg": BG_TITLE, "fg": TEXT}),
+            (lock_gap, {"bg": BG_TITLE}),
+            (body, {"bg": BG_BODY}),
+            (
+                panel,
+                {"bg": BG_PANEL, "highlightbackground": "#3B414E"},
+            ),
+            (self.message_label, {"bg": BG_PANEL}),
+            (self.resize_grip, {"bg": BG_BODY, "fg": "#717A8C"}),
+        ]
+        self._stateful_styles = {
+            self.close_button: (
+                "bg",
+                "fg",
+                "activebackground",
+                "activeforeground",
+                "disabledforeground",
+            ),
+            self.status_label: ("bg", "fg"),
+        }
+        self._constant_styles.append(
+            (
+                self.mode_button,
+                {
+                    "bg": BG_TITLE,
+                    "fg": ACCENT,
+                    "activebackground": "#343B47",
+                    "activeforeground": TEXT,
+                },
+            )
+        )
+        self._constant_styles.append((self.mode_container, {"bg": BG_PANEL}))
+        self._build_mode_views()
+
+    def _register_mode_style(
+        self,
+        widget: tk.Widget,
+        **options: str,
+    ) -> tk.Widget:
+        self._constant_styles.append((widget, options))
+        return widget
+
+    def _build_mode_views(self) -> None:
+        self.mode_views: dict[str, tk.Frame] = {}
+        for mode in WINDOW_MODES:
+            view = tk.Frame(self.mode_container, bg=BG_PANEL)
+            self._register_mode_style(view, bg=BG_PANEL)
+            self.mode_views[mode] = view
+
+        note_view = self.mode_views["便签"]
+        self.note_text = tk.Text(
+            note_view,
+            wrap="word",
+            undo=True,
+            bg=BG_PANEL,
+            fg=TEXT,
+            insertbackground=ACCENT,
+            selectbackground="#476A60",
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            font=("Microsoft YaHei UI", 11),
+            padx=8,
+            pady=6,
+        )
+        self.note_text.pack(fill="both", expand=True)
+        self._register_mode_style(self.note_text, bg=BG_PANEL)
+
+        todo_view = self.mode_views["待办"]
+        todo_entry_row = tk.Frame(todo_view, bg=BG_PANEL)
+        todo_entry_row.pack(fill="x", pady=(0, 5))
+        self._register_mode_style(todo_entry_row, bg=BG_PANEL)
+        self.todo_input = tk.Entry(
+            todo_entry_row,
+            bg=BG_BODY,
+            fg=TEXT,
+            insertbackground=ACCENT,
+            relief="flat",
+            bd=0,
+            font=("Microsoft YaHei UI", 10),
+        )
+        self.todo_input.pack(side="left", fill="x", expand=True, ipady=4)
+        self.todo_input.bind("<Return>", self._add_todo)
+        self._register_mode_style(self.todo_input, bg=BG_BODY, fg=TEXT)
+        todo_add = tk.Button(
+            todo_entry_row,
+            text="添加",
+            command=self._add_todo,
+            bg=ACCENT,
+            fg="#102219",
+            relief="flat",
+            bd=0,
+            padx=12,
+            cursor="hand2",
+        )
+        todo_add.pack(side="right", padx=(8, 0), ipady=2)
+        self._register_mode_style(todo_add, bg=ACCENT, fg="#102219")
+
+        self.todo_list = tk.Listbox(
+            todo_view,
+            bg=BG_PANEL,
+            fg=TEXT,
+            selectbackground="#3B6557",
+            selectforeground=TEXT,
+            exportselection=False,
+            activestyle="none",
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            font=("Microsoft YaHei UI", 10),
+        )
+        self.todo_list.pack(fill="both", expand=True)
+        self.todo_list.bind("<Double-Button-1>", self._toggle_todo)
+        self._register_mode_style(
+            self.todo_list,
+            bg=BG_PANEL,
+            selectbackground="#3B6557",
+        )
+        todo_actions = tk.Frame(todo_view, bg=BG_PANEL)
+        todo_actions.pack(fill="x", pady=(4, 0))
+        self._register_mode_style(todo_actions, bg=BG_PANEL)
+        for label, action in (
+            ("完成 / 撤销", self._toggle_todo),
+            ("删除选中", self._delete_todo),
+        ):
+            button = tk.Button(
+                todo_actions,
+                text=label,
+                command=action,
+                bg=BG_BODY,
+                fg=TEXT_MUTED,
+                relief="flat",
+                bd=0,
+                padx=8,
+                cursor="hand2",
+                font=("Microsoft YaHei UI", 8),
+            )
+            button.pack(side="left", padx=(0, 8))
+            self._register_mode_style(button, bg=BG_BODY, fg=TEXT_MUTED)
+
+        timer_view = self.mode_views["倒计时"]
+        self.timer_label = tk.Label(
+            timer_view,
+            text="25:00",
+            bg=BG_PANEL,
+            fg=TEXT,
+            font=("Segoe UI", 30, "bold"),
+        )
+        self.timer_label.pack(expand=True)
+        self._register_mode_style(self.timer_label, bg=BG_PANEL)
+        timer_actions = tk.Frame(timer_view, bg=BG_PANEL)
+        timer_actions.pack(pady=(0, 4))
+        self._register_mode_style(timer_actions, bg=BG_PANEL)
+        self.timer_minutes = tk.IntVar(master=self.root, value=25)
+        self.timer_minutes_input = tk.Spinbox(
+            timer_actions,
+            from_=1,
+            to=180,
+            textvariable=self.timer_minutes,
+            width=4,
+            justify="center",
+            bg=BG_BODY,
+            fg=TEXT,
+            buttonbackground=BG_TITLE,
+            insertbackground=TEXT,
+            relief="flat",
+            font=("Segoe UI", 10),
+        )
+        self.timer_minutes_input.pack(side="left", padx=(0, 3))
+        self._register_mode_style(self.timer_minutes_input, bg=BG_BODY, fg=TEXT)
+        minutes_label = tk.Label(
+            timer_actions,
+            text="分钟",
+            bg=BG_PANEL,
+            fg=TEXT_MUTED,
+            font=("Microsoft YaHei UI", 9),
+        )
+        minutes_label.pack(side="left", padx=(0, 12))
+        self._register_mode_style(minutes_label, bg=BG_PANEL, fg=TEXT_MUTED)
+        self.timer_start_button = tk.Button(
+            timer_actions,
+            text="开始",
+            command=self._toggle_timer,
+            bg=ACCENT,
+            fg="#102219",
+            relief="flat",
+            bd=0,
+            padx=13,
+            cursor="hand2",
+        )
+        self.timer_start_button.pack(side="left", padx=(0, 8))
+        self._register_mode_style(
+            self.timer_start_button,
+            bg=ACCENT,
+            fg="#102219",
+        )
+        timer_reset = tk.Button(
+            timer_actions,
+            text="重置",
+            command=self._reset_timer,
+            bg=BG_BODY,
+            fg=TEXT_MUTED,
+            relief="flat",
+            bd=0,
+            padx=13,
+            cursor="hand2",
+        )
+        timer_reset.pack(side="left")
+        self._register_mode_style(timer_reset, bg=BG_BODY, fg=TEXT_MUTED)
+
+        clock_view = self.mode_views["时钟"]
+        self.clock_time_label = tk.Label(
+            clock_view,
+            bg=BG_PANEL,
+            fg=TEXT,
+            font=("Segoe UI", 30, "bold"),
+        )
+        self.clock_time_label.pack(expand=True)
+        self._register_mode_style(self.clock_time_label, bg=BG_PANEL)
+        self.clock_date_label = tk.Label(
+            clock_view,
+            bg=BG_PANEL,
+            fg=TEXT_MUTED,
+            font=("Microsoft YaHei UI", 10),
+        )
+        self.clock_date_label.pack(pady=(0, 8))
+        self._register_mode_style(self.clock_date_label, bg=BG_PANEL)
+        self.mode_views[self.mode].pack(fill="both", expand=True)
+
+    def _show_mode_menu(self) -> None:
+        if self.locked or self._background_hidden:
+            return
+        try:
+            self.mode_menu.tk_popup(
+                self.mode_button.winfo_rootx(),
+                self.mode_button.winfo_rooty() + self.mode_button.winfo_height(),
+            )
+        finally:
+            self.mode_menu.grab_release()
+
+    def set_mode(self, mode: str) -> None:
+        if mode not in self.mode_views:
+            raise ValueError(f"未知窗口用途: {mode}")
+        if mode == self.mode:
+            return
+        self.mode_views[self.mode].pack_forget()
+        self.mode = mode
+        self.mode_views[mode].pack(fill="both", expand=True)
+        self.mode_button.configure(text=f"{mode} ▾")
+        self._apply_control_colors()
+        if self._background_hidden:
+            self._apply_background_state()
+
+    def _add_todo(self, _event: tk.Event | None = None) -> None:
+        title = self.todo_input.get().strip()
+        if not title:
+            return
+        self.todo_items.append((title, False))
+        self.todo_input.delete(0, "end")
+        self._render_todos()
+
+    def _selected_todo_index(self) -> int | None:
+        selection = self.todo_list.curselection()
+        return int(selection[0]) if selection else None
+
+    def _render_todos(self, selected: int | None = None) -> None:
+        self.todo_list.delete(0, "end")
+        for title, done in self.todo_items:
+            self.todo_list.insert("end", f"{'☑' if done else '☐'}  {title}")
+        if selected is not None and selected < len(self.todo_items):
+            self.todo_list.selection_set(selected)
+
+    def _toggle_todo(self, _event: tk.Event | None = None) -> None:
+        selected = self._selected_todo_index()
+        if selected is None:
+            return
+        title, done = self.todo_items[selected]
+        self.todo_items[selected] = (title, not done)
+        self._render_todos(selected)
+
+    def _delete_todo(self) -> None:
+        selected = self._selected_todo_index()
+        if selected is None:
+            return
+        del self.todo_items[selected]
+        self._render_todos(min(selected, len(self.todo_items) - 1))
+
+    def _timer_minutes_value(self) -> int:
+        try:
+            return _clamp(int(self.timer_minutes.get()), 1, 180)
+        except (tk.TclError, ValueError):
+            return 25
+
+    def _toggle_timer(self) -> None:
+        if self._timer_deadline is not None:
+            self._timer_remaining_seconds = max(
+                0,
+                self._timer_deadline - time.monotonic(),
+            )
+            self._timer_deadline = None
+            self.timer_start_button.configure(text="继续")
+        else:
+            if self.timer_start_button.cget("text") in ("开始", "重新开始"):
+                self._timer_remaining_seconds = self._timer_minutes_value() * 60
+            self._timer_deadline = time.monotonic() + self._timer_remaining_seconds
+            self.timer_start_button.configure(text="暂停")
+        self._update_timer_display()
+
+    def _reset_timer(self) -> None:
+        self._timer_deadline = None
+        self._timer_remaining_seconds = self._timer_minutes_value() * 60
+        self.timer_start_button.configure(text="开始")
+        self._update_timer_display()
+
+    def _update_timer_display(self) -> None:
+        remaining = max(0, math.ceil(self._timer_remaining_seconds))
+        minutes, seconds = divmod(remaining, 60)
+        self.timer_label.configure(
+            text=f"{minutes:02d}:{seconds:02d}",
+            fg=CLOSE_HOVER if remaining == 0 else TEXT,
+        )
+
+    def _tick_modes(self) -> None:
+        self._tick_after_id = None
+        if self._closed:
+            return
+        if self._timer_deadline is not None:
+            self._timer_remaining_seconds = max(
+                0,
+                self._timer_deadline - time.monotonic(),
+            )
+            if self._timer_remaining_seconds == 0:
+                self._timer_deadline = None
+                self.timer_start_button.configure(text="重新开始")
+            self._update_timer_display()
+        now = time.localtime()
+        self.clock_time_label.configure(text=time.strftime("%H:%M:%S", now))
+        weekday = "一二三四五六日"[now.tm_wday]
+        self.clock_date_label.configure(
+            text=f"{now.tm_year:04d}-{now.tm_mon:02d}-{now.tm_mday:02d}  星期{weekday}"
+        )
+        self._tick_after_id = self.root.after(250, self._tick_modes)
 
     def _build_lock_window(self) -> None:
         self.lock_window = tk.Toplevel(self.root)
@@ -1032,6 +1486,14 @@ class OverlayApp:
             takefocus=False,
         )
         self.lock_button.pack(fill="both", expand=True)
+
+        self._constant_styles.append((self.lock_window, {"bg": BG_TITLE}))
+        self._stateful_styles[self.lock_button] = (
+            "bg",
+            "fg",
+            "activebackground",
+            "activeforeground",
+        )
 
     def _build_ball_window(self) -> None:
         self.ball_window = tk.Toplevel(self.root)
@@ -1395,6 +1857,7 @@ class OverlayApp:
             not self.visible
             or self.collapsed
             or self.animating
+            or self._background_hidden
             or self.root.state() != "normal"
         ):
             self.lock_window.withdraw()
@@ -1419,6 +1882,83 @@ class OverlayApp:
         self.lock_window.attributes("-topmost", True)
         self.lock_window.lift()
         _set_native_topmost(self.lock_window)
+
+    def update_background_for_hover(self, cursor_x: int, cursor_y: int) -> None:
+        """Hide the window chrome unless the cursor is on (or near) it."""
+        if self._closed:
+            return
+        if not self.no_background.get():
+            self._set_background_hidden(False)
+            return
+        if self.collapsed or self.animating:
+            return
+
+        root_handle = _top_level_handle(self.root)
+        native_rect = Rect()
+        if not user32.GetWindowRect(
+            wintypes.HWND(root_handle),
+            ctypes.byref(native_rect),
+        ):
+            return
+        hovered = (
+            native_rect.left - HOVER_MARGIN
+            <= cursor_x
+            <= native_rect.right + HOVER_MARGIN
+            and native_rect.top - HOVER_MARGIN
+            <= cursor_y
+            <= native_rect.bottom + HOVER_MARGIN
+        )
+        interacting = self._drag_origin is not None or self._resize_origin is not None
+        self._set_background_hidden(not hovered and not interacting)
+
+    def _set_background_hidden(self, hidden: bool) -> None:
+        if self._background_hidden == hidden:
+            return
+        self._background_hidden = hidden
+        self._apply_background_state()
+        self._apply_layered_style()
+        if hidden:
+            try:
+                if self.lock_window.winfo_exists():
+                    self.lock_window.withdraw()
+            except (AttributeError, tk.TclError):
+                pass
+        else:
+            self._sync_lock_window()
+
+    def _apply_background_state(self) -> None:
+        if self._background_hidden:
+            for widget, options in self._constant_styles:
+                widget.configure(
+                    **{option: TRANSPARENT_KEY for option in options}
+                )
+            for widget, options in self._stateful_styles.items():
+                widget.configure(
+                    **{option: TRANSPARENT_KEY for option in options}
+                )
+            self.message_label.configure(text="")
+        else:
+            for widget, options in self._constant_styles:
+                widget.configure(**options)
+            self._apply_control_colors()
+
+    def _apply_layered_style(self) -> None:
+        if self._closed:
+            return
+        if self._background_hidden:
+            alpha = _clamp(
+                round(self.opacity_percent.get() * 255 / 100),
+                0,
+                255,
+            )
+            _set_layered_attributes(
+                _top_level_handle(self.root),
+                _colorref(TRANSPARENT_KEY),
+                alpha,
+                LWA_ALPHA | LWA_COLORKEY,
+            )
+        else:
+            self.root.attributes("-alpha", self.opacity_percent.get() / 100)
 
     def toggle_lock(self) -> None:
         self.set_locked(not self.locked)
@@ -1447,7 +1987,25 @@ class OverlayApp:
             | SWP_FRAMECHANGED,
         )
 
-        if locked:
+        self._apply_control_colors()
+        if not locked and self.visible:
+            self.root.attributes("-topmost", True)
+            self.root.lift()
+            self.root.focus_force()
+        if self._background_hidden:
+            self._apply_background_state()
+
+        self._sync_lock_window()
+
+    def _apply_control_colors(self) -> None:
+        self.close_button.configure(
+            bg=BG_TITLE,
+            fg=TEXT,
+            activebackground=CLOSE_HOVER,
+            activeforeground="#FFFFFF",
+            disabledforeground="#646B78",
+        )
+        if self.locked:
             self.lock_button.configure(
                 text="解锁",
                 bg=LOCKED_ACCENT,
@@ -1455,11 +2013,16 @@ class OverlayApp:
                 fg="#30200A",
                 activeforeground="#30200A",
             )
-            self.status_label.configure(text="●  已锁定 · 鼠标穿透", fg=LOCKED_ACCENT)
+            self.status_label.configure(
+                text=f"●  {self.mode} · 已锁定",
+                bg=BG_PANEL,
+                fg=LOCKED_ACCENT,
+            )
             self.message_label.configure(
-                text="现在可以直接点击窗口后方的内容\n点击右上角“解锁”恢复窗口操作"
+                text="鼠标可穿透窗口；点击右上角“解锁”恢复操作"
             )
             self.close_button.configure(state="disabled", cursor="arrow")
+            self.mode_button.configure(state="disabled", cursor="arrow")
             self.resize_grip.configure(cursor="arrow")
             self.title_bar.configure(cursor="arrow")
             self.title_label.configure(cursor="arrow")
@@ -1471,20 +2034,19 @@ class OverlayApp:
                 fg="#102219",
                 activeforeground="#102219",
             )
-            self.status_label.configure(text="●  可操作", fg=ACCENT)
+            self.status_label.configure(
+                text=f"●  {self.mode}",
+                bg=BG_PANEL,
+                fg=ACCENT,
+            )
             self.message_label.configure(
-                text="拖动顶部栏移动，拖到屏幕边缘可收起\n点击“锁定”后，鼠标操作会穿透到窗口后方"
+                text=MODE_HINTS[self.mode]
             )
             self.close_button.configure(state="normal", cursor="hand2")
+            self.mode_button.configure(state="normal", cursor="hand2")
             self.resize_grip.configure(cursor="size_nw_se")
             self.title_bar.configure(cursor="fleur")
             self.title_label.configure(cursor="fleur")
-            if self.visible:
-                self.root.attributes("-topmost", True)
-                self.root.lift()
-                self.root.focus_force()
-
-        self._sync_lock_window()
 
     def click_through_style_is_set(self) -> bool:
         hwnd = _top_level_handle(self.root)
@@ -1495,6 +2057,12 @@ class OverlayApp:
         if self._closed:
             return
         self._closed = True
+        if self._tick_after_id is not None:
+            try:
+                self.root.after_cancel(self._tick_after_id)
+            except tk.TclError:
+                pass
+            self._tick_after_id = None
         try:
             if self.lock_window.winfo_exists():
                 self.lock_window.destroy()
@@ -1516,7 +2084,7 @@ class OverlayApp:
     def apply_shared_settings(self) -> None:
         if self._closed:
             return
-        self.root.attributes("-alpha", self.opacity_percent.get() / 100)
+        self._apply_layered_style()
 
     def run(self) -> None:
         self.root.mainloop()
@@ -1559,12 +2127,18 @@ class DesktopManager:
             master=self.root,
             value=saved_settings["restore_margin"],
         )
+        self.no_background = tk.BooleanVar(
+            master=self.root,
+            value=saved_settings["no_background"],
+        )
         for setting_variable in (
             self.opacity_percent,
             self.edge_collapse_enabled,
             self.restore_margin,
+            self.no_background,
         ):
             setting_variable.trace_add("write", self._schedule_settings_save)
+        self.no_background.trace_add("write", self._on_no_background_changed)
         # Write defaults on first launch and normalize older or manually edited files.
         self._settings_dirty = True
         self._settings_save_after_id = self.root.after(250, self._save_settings_now)
@@ -1579,6 +2153,7 @@ class DesktopManager:
 
         if create_initial_window:
             self.add_window(initial_position=initial_position)
+        self.root.after(HOVER_POLL_MS, self._poll_hover)
 
     def add_window(
         self,
@@ -1602,6 +2177,7 @@ class DesktopManager:
             opacity_percent=self.opacity_percent,
             edge_collapse_enabled=self.edge_collapse_enabled,
             restore_margin=self.restore_margin,
+            no_background=self.no_background,
             instance_number=self._next_instance_number,
         )
         self._next_instance_number += 1
@@ -1613,6 +2189,23 @@ class DesktopManager:
         if window in self.windows:
             self.windows.remove(window)
         self._update_instance_count()
+
+    def _on_no_background_changed(self, *_trace_arguments: str) -> None:
+        self._refresh_backgrounds()
+
+    def _refresh_backgrounds(self) -> None:
+        if self._exiting:
+            return
+        cursor = Point()
+        user32.GetCursorPos(ctypes.byref(cursor))
+        for window in tuple(self.windows):
+            window.update_background_for_hover(cursor.x, cursor.y)
+
+    def _poll_hover(self) -> None:
+        if self._exiting:
+            return
+        self._refresh_backgrounds()
+        self.root.after(HOVER_POLL_MS, self._poll_hover)
 
     def open_settings(self) -> None:
         if self.settings_window is not None and self.settings_window.winfo_exists():
@@ -1705,6 +2298,20 @@ class DesktopManager:
             highlightthickness=0,
         ).pack(fill="x", padx=18, pady=(0, 12))
 
+        tk.Checkbutton(
+            window,
+            text="无背景（鼠标移入时才显示背景和按钮）",
+            variable=self.no_background,
+            bg=BG_BODY,
+            fg=TEXT,
+            activebackground=BG_BODY,
+            activeforeground=TEXT,
+            selectcolor=BG_PANEL,
+            font=("Microsoft YaHei UI", 10),
+            anchor="w",
+            highlightthickness=0,
+        ).pack(fill="x", padx=18, pady=(0, 12))
+
         margin_row = tk.Frame(window, bg=BG_BODY)
         margin_row.pack(fill="x", padx=22)
         tk.Label(
@@ -1780,7 +2387,7 @@ class DesktopManager:
         ).pack(side="right")
 
         settings_width = 400
-        settings_height = 330
+        settings_height = 366
         cursor = Point()
         user32.GetCursorPos(ctypes.byref(cursor))
         _monitor_area, work_area = _monitor_areas_at(cursor.x, cursor.y)
@@ -1835,10 +2442,15 @@ class DesktopManager:
             edge_collapse = bool(self.edge_collapse_enabled.get())
         except tk.TclError:
             edge_collapse = bool(SettingsStore.DEFAULTS["edge_collapse_enabled"])
+        try:
+            no_background = bool(self.no_background.get())
+        except tk.TclError:
+            no_background = bool(SettingsStore.DEFAULTS["no_background"])
         return {
             "opacity_percent": _clamp(opacity, 55, 100),
             "edge_collapse_enabled": edge_collapse,
             "restore_margin": _clamp(restore_margin, 0, 80),
+            "no_background": no_background,
         }
 
     def _save_settings_now(self) -> None:
@@ -1878,6 +2490,7 @@ class DesktopManager:
         self.opacity_percent.set(86)
         self.edge_collapse_enabled.set(True)
         self.restore_margin.set(RESTORE_MARGIN)
+        self.no_background.set(False)
         self._on_opacity_changed("86")
 
     def close_settings(self) -> None:
@@ -1923,6 +2536,29 @@ def _self_test() -> None:
     app = OverlayApp(visible=False)
     app.root.update()
     assert _position_from_arguments(["--position", "-120", "80"]) == (-120, 80)
+    assert app.mode == "便签"
+    app.note_text.insert("1.0", "临时想法")
+    app.mode_menu.invoke(1)
+    assert app.mode == "待办", "mode menu did not switch the window purpose"
+    app.todo_input.insert(0, "检查切换")
+    app._add_todo()
+    assert app.todo_items == [("检查切换", False)]
+    app.todo_list.selection_set(0)
+    app._toggle_todo()
+    assert app.todo_items == [("检查切换", True)]
+    app.set_mode("倒计时")
+    app.timer_minutes.set(2)
+    app._reset_timer()
+    assert app.timer_label.cget("text") == "02:00"
+    app._toggle_timer()
+    assert app._timer_deadline is not None
+    app._toggle_timer()
+    assert app._timer_deadline is None
+    app.set_mode("时钟")
+    assert app.clock_time_label.cget("text")
+    app.set_mode("便签")
+    assert app.note_text.get("1.0", "end-1c") == "临时想法"
+    assert app.todo_items == [("检查切换", True)]
 
     _set_absolute_geometry(
         app.root,
@@ -1944,9 +2580,62 @@ def _self_test() -> None:
     app.set_locked(True)
     app.root.update()
     assert app.click_through_style_is_set(), "click-through style was not enabled"
+    assert app.mode_button.cget("state") == "disabled"
     app.set_locked(False)
     app.root.update()
     assert not app.click_through_style_is_set(), "click-through style was not disabled"
+    assert app.mode_button.cget("state") == "normal"
+
+    app.no_background.set(True)
+    app.update_background_for_hover(-100000, -100000)
+    assert app._background_hidden, "background was not hidden away from the cursor"
+    assert app.title_bar.cget("bg") == TRANSPARENT_KEY
+    assert app.title_label.cget("fg") == TRANSPARENT_KEY
+    assert app.status_label.cget("bg") == TRANSPARENT_KEY
+    assert app.status_label.cget("fg") == TRANSPARENT_KEY
+    assert app.message_label.cget("fg") == TEXT
+    assert app.close_button.cget("fg") == TRANSPARENT_KEY
+    assert app.lock_button.cget("fg") == TRANSPARENT_KEY
+    assert app.mode_button.cget("fg") == TRANSPARENT_KEY
+    assert app.note_text.cget("bg") == TRANSPARENT_KEY
+    assert app.note_text.cget("fg") == TEXT
+    app.set_mode("时钟")
+    assert app.clock_time_label.cget("bg") == TRANSPARENT_KEY
+    assert app.message_label.cget("text") == ""
+    app.set_mode("便签")
+    layered_key = wintypes.DWORD()
+    layered_alpha = ctypes.c_ubyte()
+    layered_flags = wintypes.DWORD()
+    assert user32.GetLayeredWindowAttributes(
+        wintypes.HWND(root_handle),
+        ctypes.byref(layered_key),
+        ctypes.byref(layered_alpha),
+        ctypes.byref(layered_flags),
+    ), "layered window attributes are unavailable"
+    assert layered_flags.value & LWA_COLORKEY, "background color key was not applied"
+    assert layered_key.value == _colorref(TRANSPARENT_KEY)
+
+    app.update_background_for_hover(
+        app.root.winfo_x() + 5,
+        app.root.winfo_y() + 5,
+    )
+    assert not app._background_hidden, "background was not restored on hover"
+    assert app.title_bar.cget("bg") == BG_TITLE
+    assert app.title_label.cget("fg") == TEXT
+    assert app.status_label.cget("bg") == BG_PANEL
+    assert app.status_label.cget("fg") == ACCENT
+    assert app.close_button.cget("fg") == TEXT
+    assert app.lock_button.cget("fg") == "#102219"
+    layered_flags = wintypes.DWORD()
+    assert user32.GetLayeredWindowAttributes(
+        wintypes.HWND(root_handle),
+        ctypes.byref(layered_key),
+        ctypes.byref(layered_alpha),
+        ctypes.byref(layered_flags),
+    )
+    assert not layered_flags.value & LWA_COLORKEY, "background color key was not cleared"
+    app.no_background.set(False)
+    app.root.update()
 
     cursor = Point()
     user32.GetCursorPos(ctypes.byref(cursor))
@@ -2019,6 +2708,11 @@ def _self_test() -> None:
         time.sleep(0.01)
     assert len(manager.windows) == 2, "manager did not create two instances"
     first_window, second_window = manager.windows
+    first_window.set_mode("待办")
+    first_window.todo_input.insert(0, "只属于第一个窗口")
+    first_window._add_todo()
+    assert second_window.mode == "便签"
+    assert not second_window.todo_items
     manager.tray.dispatch_command_for_test(TRAY_COMMAND_SETTINGS)
     deadline = time.monotonic() + 1
     while manager.settings_window is None and time.monotonic() < deadline:
@@ -2030,14 +2724,18 @@ def _self_test() -> None:
     assert abs(float(second_window.root.attributes("-alpha")) - 0.73) < 0.01
     manager.reset_settings()
     assert manager.opacity_percent.get() == 86
+    assert manager.no_background.get() is False
     manager.opacity_percent.set(77)
     manager.edge_collapse_enabled.set(False)
     manager.restore_margin.set(17)
+    manager.no_background.set(True)
+    assert first_window._background_hidden, "no-background state was not shared"
     manager._save_settings_now()
     saved_settings = json.loads(test_settings_path.read_text(encoding="utf-8"))
     assert saved_settings["opacity_percent"] == 77
     assert saved_settings["edge_collapse_enabled"] is False
     assert saved_settings["restore_margin"] == 17
+    assert saved_settings["no_background"] is True
     manager.close_settings()
     first_window.close()
     assert len(manager.windows) == 1, "closing one instance stopped the manager"
@@ -2057,11 +2755,13 @@ def _self_test() -> None:
     assert reloaded_manager.opacity_percent.get() == 77
     assert reloaded_manager.edge_collapse_enabled.get() is False
     assert reloaded_manager.restore_margin.get() == 17
+    assert reloaded_manager.no_background.get() is True
     reloaded_manager.exit_app()
     temporary_settings_directory.cleanup()
     print(
         "Self-test passed: tray manager and icons, persistent settings, "
-        "background lifetime, lock styles, and ball collapse/restore work correctly."
+        "four independent window modes, no-background mode, background "
+        "lifetime, lock styles, and ball collapse/restore work correctly."
     )
 
 
