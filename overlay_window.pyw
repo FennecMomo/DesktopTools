@@ -47,6 +47,8 @@ BG_PANEL = "#222730"
 BORDER = "#4B5262"
 TEXT = "#F5F7FA"
 TEXT_MUTED = "#AAB2C0"
+NO_BACKGROUND_TEXT = "#17212D"
+NO_BACKGROUND_MUTED = "#344455"
 ACCENT = "#66D9A6"
 ACCENT_HOVER = "#80E5B7"
 LOCKED_ACCENT = "#F5B85C"
@@ -980,6 +982,7 @@ class OverlayApp:
             cursor="fleur",
         )
         grip.pack(side="left")
+        self.drag_grip = grip
 
         self.title_label = tk.Label(
             self.title_bar,
@@ -1183,11 +1186,11 @@ class OverlayApp:
         self._register_mode_style(self.note_text, bg=BG_PANEL)
 
         todo_view = self.mode_views["待办"]
-        todo_entry_row = tk.Frame(todo_view, bg=BG_PANEL)
-        todo_entry_row.pack(fill="x", pady=(0, 5))
-        self._register_mode_style(todo_entry_row, bg=BG_PANEL)
+        self.todo_entry_row = tk.Frame(todo_view, bg=BG_PANEL)
+        self.todo_entry_row.pack(fill="x", pady=(0, 5))
+        self._register_mode_style(self.todo_entry_row, bg=BG_PANEL)
         self.todo_input = tk.Entry(
-            todo_entry_row,
+            self.todo_entry_row,
             bg=BG_BODY,
             fg=TEXT,
             insertbackground=ACCENT,
@@ -1199,7 +1202,7 @@ class OverlayApp:
         self.todo_input.bind("<Return>", self._add_todo)
         self._register_mode_style(self.todo_input, bg=BG_BODY, fg=TEXT)
         todo_add = tk.Button(
-            todo_entry_row,
+            self.todo_entry_row,
             text="添加",
             command=self._add_todo,
             bg=ACCENT,
@@ -1232,15 +1235,15 @@ class OverlayApp:
             bg=BG_PANEL,
             selectbackground="#3B6557",
         )
-        todo_actions = tk.Frame(todo_view, bg=BG_PANEL)
-        todo_actions.pack(fill="x", pady=(4, 0))
-        self._register_mode_style(todo_actions, bg=BG_PANEL)
+        self.todo_actions = tk.Frame(todo_view, bg=BG_PANEL)
+        self.todo_actions.pack(fill="x", pady=(4, 0))
+        self._register_mode_style(self.todo_actions, bg=BG_PANEL)
         for label, action in (
             ("完成 / 撤销", self._toggle_todo),
             ("删除选中", self._delete_todo),
         ):
             button = tk.Button(
-                todo_actions,
+                self.todo_actions,
                 text=label,
                 command=action,
                 bg=BG_BODY,
@@ -1264,12 +1267,12 @@ class OverlayApp:
         )
         self.timer_label.pack(expand=True)
         self._register_mode_style(self.timer_label, bg=BG_PANEL)
-        timer_actions = tk.Frame(timer_view, bg=BG_PANEL)
-        timer_actions.pack(pady=(0, 4))
-        self._register_mode_style(timer_actions, bg=BG_PANEL)
+        self.timer_actions = tk.Frame(timer_view, bg=BG_PANEL)
+        self.timer_actions.pack(pady=(0, 4))
+        self._register_mode_style(self.timer_actions, bg=BG_PANEL)
         self.timer_minutes = tk.IntVar(master=self.root, value=25)
         self.timer_minutes_input = tk.Spinbox(
-            timer_actions,
+            self.timer_actions,
             from_=1,
             to=180,
             textvariable=self.timer_minutes,
@@ -1285,7 +1288,7 @@ class OverlayApp:
         self.timer_minutes_input.pack(side="left", padx=(0, 3))
         self._register_mode_style(self.timer_minutes_input, bg=BG_BODY, fg=TEXT)
         minutes_label = tk.Label(
-            timer_actions,
+            self.timer_actions,
             text="分钟",
             bg=BG_PANEL,
             fg=TEXT_MUTED,
@@ -1294,7 +1297,7 @@ class OverlayApp:
         minutes_label.pack(side="left", padx=(0, 12))
         self._register_mode_style(minutes_label, bg=BG_PANEL, fg=TEXT_MUTED)
         self.timer_start_button = tk.Button(
-            timer_actions,
+            self.timer_actions,
             text="开始",
             command=self._toggle_timer,
             bg=ACCENT,
@@ -1311,7 +1314,7 @@ class OverlayApp:
             fg="#102219",
         )
         timer_reset = tk.Button(
-            timer_actions,
+            self.timer_actions,
             text="重置",
             command=self._reset_timer,
             bg=BG_BODY,
@@ -1433,7 +1436,11 @@ class OverlayApp:
         minutes, seconds = divmod(remaining, 60)
         self.timer_label.configure(
             text=f"{minutes:02d}:{seconds:02d}",
-            fg=CLOSE_HOVER if remaining == 0 else TEXT,
+            fg=(
+                CLOSE_HOVER
+                if remaining == 0
+                else NO_BACKGROUND_TEXT if self._background_hidden else TEXT
+            ),
         )
 
     def _tick_modes(self) -> None:
@@ -1936,25 +1943,55 @@ class OverlayApp:
                 widget.configure(
                     **{option: TRANSPARENT_KEY for option in options}
                 )
-            self.message_label.configure(text="")
+            # A transparent foreground still leaves antialiased glyph pixels
+            # around the color key. Remove chrome text and widgets entirely.
+            self.drag_grip.configure(text="")
+            self.title_label.configure(text="")
+            self.mode_button.configure(text="")
+            self.close_button.configure(text="")
+            self.resize_grip.configure(text="")
+            self.status_label.pack_forget()
+            self.message_label.pack_forget()
+            self.todo_entry_row.pack_forget()
+            self.todo_actions.pack_forget()
+            self.timer_actions.pack_forget()
         else:
             for widget, options in self._constant_styles:
                 widget.configure(**options)
+            self.drag_grip.configure(text="⠿")
+            self.title_label.configure(text=f"自由窗口 #{self.instance_number}")
+            self.mode_button.configure(text=f"{self.mode} ▾")
+            self.close_button.configure(text="×")
+            self.resize_grip.configure(text="◢")
+            self.status_label.pack(pady=(10, 2), before=self.mode_container)
+            self.message_label.pack(before=self.mode_container)
+            self.todo_entry_row.pack(
+                fill="x",
+                pady=(0, 5),
+                before=self.todo_list,
+            )
+            self.todo_actions.pack(fill="x", pady=(4, 0))
+            self.timer_actions.pack(pady=(0, 4))
             self._apply_control_colors()
+        self._apply_content_colors()
+
+    def _apply_content_colors(self) -> None:
+        text_color = NO_BACKGROUND_TEXT if self._background_hidden else TEXT
+        muted_color = NO_BACKGROUND_MUTED if self._background_hidden else TEXT_MUTED
+        self.note_text.configure(fg=text_color)
+        self.todo_list.configure(fg=text_color, selectforeground=text_color)
+        self.clock_time_label.configure(fg=text_color)
+        self.clock_date_label.configure(fg=muted_color)
+        self._update_timer_display()
 
     def _apply_layered_style(self) -> None:
         if self._closed:
             return
         if self._background_hidden:
-            alpha = _clamp(
-                round(self.opacity_percent.get() * 255 / 100),
-                0,
-                255,
-            )
             _set_layered_attributes(
                 _top_level_handle(self.root),
                 _colorref(TRANSPARENT_KEY),
-                alpha,
+                255,
                 LWA_ALPHA | LWA_COLORKEY,
             )
         else:
@@ -2591,17 +2628,31 @@ def _self_test() -> None:
     assert app._background_hidden, "background was not hidden away from the cursor"
     assert app.title_bar.cget("bg") == TRANSPARENT_KEY
     assert app.title_label.cget("fg") == TRANSPARENT_KEY
+    assert app.title_label.cget("text") == ""
+    assert app.drag_grip.cget("text") == ""
     assert app.status_label.cget("bg") == TRANSPARENT_KEY
     assert app.status_label.cget("fg") == TRANSPARENT_KEY
+    assert app.status_label.winfo_manager() == ""
     assert app.message_label.cget("fg") == TEXT
+    assert app.message_label.winfo_manager() == ""
     assert app.close_button.cget("fg") == TRANSPARENT_KEY
+    assert app.close_button.cget("text") == ""
     assert app.lock_button.cget("fg") == TRANSPARENT_KEY
     assert app.mode_button.cget("fg") == TRANSPARENT_KEY
+    assert app.mode_button.cget("text") == ""
     assert app.note_text.cget("bg") == TRANSPARENT_KEY
-    assert app.note_text.cget("fg") == TEXT
+    assert app.note_text.cget("fg") == NO_BACKGROUND_TEXT
+    assert app.note_text.get("1.0", "end-1c") == "临时想法"
+    app.set_mode("待办")
+    assert app.todo_entry_row.winfo_manager() == ""
+    assert app.todo_actions.winfo_manager() == ""
+    assert app.todo_list.cget("fg") == NO_BACKGROUND_TEXT
+    app.set_mode("倒计时")
+    assert app.timer_actions.winfo_manager() == ""
+    assert app.timer_label.cget("fg") == NO_BACKGROUND_TEXT
     app.set_mode("时钟")
     assert app.clock_time_label.cget("bg") == TRANSPARENT_KEY
-    assert app.message_label.cget("text") == ""
+    assert app.clock_time_label.cget("fg") == NO_BACKGROUND_TEXT
     app.set_mode("便签")
     layered_key = wintypes.DWORD()
     layered_alpha = ctypes.c_ubyte()
@@ -2614,6 +2665,7 @@ def _self_test() -> None:
     ), "layered window attributes are unavailable"
     assert layered_flags.value & LWA_COLORKEY, "background color key was not applied"
     assert layered_key.value == _colorref(TRANSPARENT_KEY)
+    assert layered_alpha.value == 255, "foreground was dimmed without a background"
 
     app.update_background_for_hover(
         app.root.winfo_x() + 5,
@@ -2622,10 +2674,17 @@ def _self_test() -> None:
     assert not app._background_hidden, "background was not restored on hover"
     assert app.title_bar.cget("bg") == BG_TITLE
     assert app.title_label.cget("fg") == TEXT
+    assert app.title_label.cget("text") == "自由窗口 #1"
+    assert app.mode_button.cget("text") == "便签 ▾"
     assert app.status_label.cget("bg") == BG_PANEL
     assert app.status_label.cget("fg") == ACCENT
+    assert app.status_label.winfo_manager() == "pack"
+    assert app.message_label.winfo_manager() == "pack"
     assert app.close_button.cget("fg") == TEXT
     assert app.lock_button.cget("fg") == "#102219"
+    assert app.note_text.cget("fg") == TEXT
+    assert app.todo_entry_row.winfo_manager() == "pack"
+    assert app.timer_actions.winfo_manager() == "pack"
     layered_flags = wintypes.DWORD()
     assert user32.GetLayeredWindowAttributes(
         wintypes.HWND(root_handle),
