@@ -26,7 +26,7 @@ from queue import Empty, Queue
 
 
 APP_TITLE = "DesktopTools 自由窗口"
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.1.0"
 UPDATE_MANIFEST_URL = (
     "https://raw.githubusercontent.com/FennecMomo/DesktopTools/"
     "main/dist/update.json"
@@ -57,7 +57,7 @@ HOVER_MARGIN = 16
 WINDOW_MODES = ("便签", "待办", "倒计时", "时钟")
 MODE_HINTS = {
     "便签": "把临时想法放在手边",
-    "待办": "双击事项即可切换完成状态",
+    "待办": "双击切换完成；选中后可编辑或删除",
     "倒计时": "专注、休息或提醒自己换个任务",
     "时钟": "开会或全屏工作时也能看到时间",
 }
@@ -1339,6 +1339,7 @@ class OverlayApp:
         self._sync_scheduled = False
         self.mode = WINDOW_MODES[0]
         self.todo_items: list[tuple[str, bool]] = []
+        self._editing_todo_index: int | None = None
         self._timer_duration_minutes = 25
         self._timer_remaining_seconds = 25 * 60
         self._timer_deadline: float | None = None
@@ -1731,7 +1732,7 @@ class OverlayApp:
         self.todo_input.pack(side="left", fill="x", expand=True, ipady=4)
         self.todo_input.bind("<Return>", self._add_todo)
         self._register_mode_style(self.todo_input, bg=BG_BODY, fg=TEXT)
-        todo_add = tk.Button(
+        self.todo_add_button = tk.Button(
             self.todo_entry_row,
             text="添加",
             command=self._add_todo,
@@ -1742,8 +1743,20 @@ class OverlayApp:
             padx=12,
             cursor="hand2",
         )
-        todo_add.pack(side="right", padx=(8, 0), ipady=2)
-        self._register_mode_style(todo_add, bg=ACCENT, fg="#102219")
+        self.todo_add_button.pack(side="right", padx=(8, 0), ipady=2)
+        self._register_mode_style(self.todo_add_button, bg=ACCENT, fg="#102219")
+        self.todo_cancel_button = tk.Button(
+            self.todo_entry_row,
+            text="取消",
+            command=self._cancel_todo_edit,
+            bg=BG_BODY,
+            fg=TEXT_MUTED,
+            relief="flat",
+            bd=0,
+            padx=8,
+            cursor="hand2",
+        )
+        self._register_mode_style(self.todo_cancel_button, bg=BG_BODY, fg=TEXT_MUTED)
 
         self.todo_list = tk.Listbox(
             todo_view,
@@ -1758,19 +1771,21 @@ class OverlayApp:
             highlightthickness=0,
             font=("Microsoft YaHei UI", 10),
         )
-        self.todo_list.pack(fill="both", expand=True)
         self.todo_list.bind("<Double-Button-1>", self._toggle_todo)
+        self.todo_list.bind("<F2>", self._edit_todo)
+        self.todo_list.bind("<Delete>", self._delete_todo)
         self._register_mode_style(
             self.todo_list,
             bg=BG_PANEL,
             selectbackground="#3B6557",
         )
         self.todo_actions = tk.Frame(todo_view, bg=BG_PANEL)
-        self.todo_actions.pack(fill="x", pady=(4, 0))
+        self.todo_actions.pack(side="bottom", fill="x", pady=(4, 0))
         self._register_mode_style(self.todo_actions, bg=BG_PANEL)
-        for label, action in (
-            ("完成 / 撤销", self._toggle_todo),
-            ("删除选中", self._delete_todo),
+        for name, label, action in (
+            ("todo_toggle_button", "完成 / 撤销", self._toggle_todo),
+            ("todo_edit_button", "编辑选中", self._edit_todo),
+            ("todo_delete_button", "删除选中", self._delete_todo),
         ):
             button = tk.Button(
                 self.todo_actions,
@@ -1784,8 +1799,10 @@ class OverlayApp:
                 cursor="hand2",
                 font=("Microsoft YaHei UI", 8),
             )
+            setattr(self, name, button)
             button.pack(side="left", padx=(0, 8))
             self._register_mode_style(button, bg=BG_BODY, fg=TEXT_MUTED)
+        self.todo_list.pack(fill="both", expand=True)
 
         timer_view = self.mode_views["倒计时"]
         self.timer_label = tk.Label(
@@ -2067,10 +2084,35 @@ class OverlayApp:
         title = self.todo_input.get().strip()
         if not title:
             return
-        self.todo_items.append((title, False))
-        self.todo_input.delete(0, "end")
-        self._render_todos()
+        editing = self._editing_todo_index
+        if editing is not None and 0 <= editing < len(self.todo_items):
+            _, done = self.todo_items[editing]
+            self.todo_items[editing] = (title, done)
+            self._cancel_todo_edit()
+            self._render_todos(editing)
+        else:
+            self.todo_items.append((title, False))
+            self.todo_input.delete(0, "end")
+            self._render_todos(len(self.todo_items) - 1)
         self._notify_state_changed()
+
+    def _edit_todo(self, _event: tk.Event | None = None) -> None:
+        selected = self._selected_todo_index()
+        if selected is None:
+            return
+        self._editing_todo_index = selected
+        self.todo_input.delete(0, "end")
+        self.todo_input.insert(0, self.todo_items[selected][0])
+        self.todo_add_button.configure(text="保存修改")
+        self.todo_cancel_button.pack(side="right", padx=(0, 8), ipady=2)
+        self.todo_input.focus_set()
+        self.todo_input.selection_range(0, "end")
+
+    def _cancel_todo_edit(self) -> None:
+        self._editing_todo_index = None
+        self.todo_input.delete(0, "end")
+        self.todo_add_button.configure(text="添加")
+        self.todo_cancel_button.pack_forget()
 
     def _selected_todo_index(self) -> int | None:
         selection = self.todo_list.curselection()
@@ -2080,7 +2122,7 @@ class OverlayApp:
         self.todo_list.delete(0, "end")
         for title, done in self.todo_items:
             self.todo_list.insert("end", f"{'☑' if done else '☐'}  {title}")
-        if selected is not None and selected < len(self.todo_items):
+        if selected is not None and 0 <= selected < len(self.todo_items):
             self.todo_list.selection_set(selected)
         self._refresh_outlined_content()
 
@@ -2093,11 +2135,15 @@ class OverlayApp:
         self._render_todos(selected)
         self._notify_state_changed()
 
-    def _delete_todo(self) -> None:
+    def _delete_todo(self, _event: tk.Event | None = None) -> None:
         selected = self._selected_todo_index()
         if selected is None:
             return
         del self.todo_items[selected]
+        if self._editing_todo_index == selected:
+            self._cancel_todo_edit()
+        elif self._editing_todo_index is not None and selected < self._editing_todo_index:
+            self._editing_todo_index -= 1
         self._render_todos(min(selected, len(self.todo_items) - 1))
         self._notify_state_changed()
 
@@ -2738,7 +2784,12 @@ class OverlayApp:
                 pady=(0, 5),
             )
             self._set_outlined_view(False)
-            self.todo_actions.pack(fill="x", pady=(4, 0))
+            self.todo_actions.pack(
+                side="bottom",
+                fill="x",
+                pady=(4, 0),
+                before=self.todo_list,
+            )
             self.timer_actions.pack(pady=(0, 4))
             self._apply_control_colors()
 
@@ -3730,6 +3781,31 @@ def _self_test() -> None:
     app.todo_list.selection_set(0)
     app._toggle_todo()
     assert app.todo_items == [("检查切换", True)]
+    app.todo_edit_button.invoke()
+    assert app.todo_input.get() == "检查切换"
+    assert app.todo_add_button.cget("text") == "保存修改"
+    app.todo_input.delete(0, "end")
+    app.todo_input.insert(0, "修改后的待办")
+    app.todo_add_button.invoke()
+    assert app.todo_items == [("修改后的待办", True)]
+    assert app.todo_add_button.cget("text") == "添加"
+    app._edit_todo()
+    app.todo_input.delete(0, "end")
+    app.todo_input.insert(0, "不保存")
+    app.todo_cancel_button.invoke()
+    assert app.todo_items == [("修改后的待办", True)]
+    app.todo_input.insert(0, "临时待办")
+    app._add_todo()
+    app.todo_list.selection_clear(0, "end")
+    app.todo_list.selection_set(1)
+    app.todo_delete_button.invoke()
+    assert app.todo_items == [("修改后的待办", True)]
+    app.todo_list.selection_set(0)
+    app._edit_todo()
+    app.todo_input.delete(0, "end")
+    app.todo_input.insert(0, "检查切换")
+    app._add_todo()
+    assert app.todo_items == [("检查切换", True)]
     app.set_mode("倒计时")
     app.timer_minutes.set(2)
     app._reset_timer()
@@ -4049,10 +4125,39 @@ def _self_test() -> None:
     first_window, second_window = manager.windows
     first_window.note_text.insert("1.0", "第一扇便签")
     first_window.set_mode("待办")
+    manager.root.update()
+    assert first_window.todo_actions.winfo_ismapped(), (
+        "todo edit/delete controls are hidden at the default window size"
+    )
+    assert first_window.todo_edit_button.winfo_ismapped()
+    assert first_window.todo_delete_button.winfo_ismapped()
+    assert (
+        first_window.todo_actions.winfo_y()
+        + first_window.todo_actions.winfo_height()
+        <= first_window.mode_views["待办"].winfo_height()
+    )
+    first_window.todo_input.insert(0, "快捷键临时项")
+    first_window.todo_add_button.invoke()
+    manager.root.update()
+    first_window.todo_list.focus_force()
+    manager.root.update()
+    first_window.todo_list.event_generate("<F2>")
+    manager.root.update()
+    assert first_window._editing_todo_index == 0
+    first_window.todo_cancel_button.invoke()
+    first_window.todo_list.focus_force()
+    manager.root.update()
+    first_window.todo_list.event_generate("<Delete>")
+    manager.root.update()
+    assert not first_window.todo_items
     first_window.todo_input.insert(0, "只属于第一个窗口")
     first_window._add_todo()
     first_window.todo_list.selection_set(0)
     first_window._toggle_todo()
+    first_window._edit_todo()
+    first_window.todo_input.delete(0, "end")
+    first_window.todo_input.insert(0, "改好的待办")
+    first_window._add_todo()
     first_window.timer_minutes.set(7)
     second_window.note_text.insert("1.0", "第二扇便签")
     _, test_work_area = _monitor_areas_at(
@@ -4080,7 +4185,7 @@ def _self_test() -> None:
     assert saved_windows[0]["geometry"] == [470, 310, test_x, test_y], saved_windows[0]["geometry"]
     assert saved_windows[0]["note"] == "第一扇便签"
     assert saved_windows[0]["todos"] == [
-        {"text": "只属于第一个窗口", "done": True}
+        {"text": "改好的待办", "done": True}
     ]
     assert saved_windows[0]["timer_minutes"] == 7
     assert saved_windows[1]["note"] == "第二扇便签"
@@ -4209,7 +4314,7 @@ def _self_test() -> None:
     assert revived_first.instance_number == first_window.instance_number
     assert revived_first.mode == "待办"
     assert revived_first.note_text.get("1.0", "end-1c") == "第一扇便签"
-    assert revived_first.todo_items == [("只属于第一个窗口", True)]
+    assert revived_first.todo_items == [("改好的待办", True)]
     assert revived_first.timer_minutes.get() == 7
     assert _native_window_geometry(revived_first.root) == (
         470, 310, test_x, test_y
@@ -4267,7 +4372,7 @@ def _self_test() -> None:
     assert not reloaded_second.locked
     reloaded_second.set_locked(True)
     assert reloaded_first.mode == "待办"
-    assert reloaded_first.todo_items == [("只属于第一个窗口", True)]
+    assert reloaded_first.todo_items == [("改好的待办", True)]
     assert reloaded_first.timer_minutes.get() == 7
     assert reloaded_first.collapsed
     assert reloaded_first._ball_geometry == test_ball
@@ -4303,7 +4408,8 @@ def _self_test() -> None:
         "Self-test passed: tray manager and icons, persistent settings and windows, "
         "per-user auto-start option, "
         "verified GitHub update index and persistent auto-update option, "
-        "four independent window modes, empty-note placeholder, "
+        "four independent window modes, editable and removable todos, "
+        "empty-note placeholder, "
         "no-background mode, persistent content-visible click-through lock, "
         "background lifetime, "
         "and ball collapse/restore work correctly."
