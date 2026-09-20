@@ -23,6 +23,7 @@ MIN_HEIGHT = 280
 TITLE_HEIGHT = 48
 LOCK_WIDTH = 68
 LOCK_HEIGHT = 32
+UNLOCK_ICON_SIZE = 38
 CLOSE_AREA_WIDTH = 48
 BALL_SIZE = 58
 BALL_MARGIN = 6
@@ -1184,6 +1185,15 @@ class OverlayApp:
         )
         self.note_text.pack(fill="both", expand=True)
         self._register_mode_style(self.note_text, bg=BG_PANEL)
+        self.empty_note_label = tk.Label(
+            note_view,
+            text="空便签",
+            bg=BG_PANEL,
+            fg=NO_BACKGROUND_MUTED,
+            font=("Microsoft YaHei UI", 12, "bold"),
+        )
+        self._register_mode_style(self.empty_note_label, bg=BG_PANEL)
+        self.note_text.bind("<<Modified>>", self._on_note_modified)
 
         todo_view = self.mode_views["待办"]
         self.todo_entry_row = tk.Frame(todo_view, bg=BG_PANEL)
@@ -1369,6 +1379,26 @@ class OverlayApp:
         self._apply_control_colors()
         if self._background_hidden:
             self._apply_background_state()
+        self._refresh_empty_note_label()
+
+    def _on_note_modified(self, _event: tk.Event) -> None:
+        if not self.note_text.edit_modified():
+            return
+        self.note_text.edit_modified(False)
+        self._refresh_empty_note_label()
+
+    def _refresh_empty_note_label(self) -> None:
+        show_placeholder = (
+            self._background_hidden
+            and not self.locked
+            and self.mode == "便签"
+            and not self.note_text.get("1.0", "end-1c").strip()
+        )
+        if show_placeholder:
+            self.empty_note_label.place(relx=0.5, rely=0.5, anchor="center")
+            self.empty_note_label.lift()
+        else:
+            self.empty_note_label.place_forget()
 
     def _add_todo(self, _event: tk.Event | None = None) -> None:
         title = self.todo_input.get().strip()
@@ -1474,6 +1504,7 @@ class OverlayApp:
         self.lock_window.attributes("-topmost", True)
         try:
             self.lock_window.attributes("-toolwindow", True)
+            self.lock_window.attributes("-transparentcolor", TRANSPARENT_KEY)
         except tk.TclError:
             pass
 
@@ -1493,6 +1524,56 @@ class OverlayApp:
             takefocus=False,
         )
         self.lock_button.pack(fill="both", expand=True)
+
+        self.unlock_canvas = tk.Canvas(
+            self.lock_window,
+            width=UNLOCK_ICON_SIZE,
+            height=UNLOCK_ICON_SIZE,
+            bg=TRANSPARENT_KEY,
+            bd=0,
+            highlightthickness=0,
+            cursor="hand2",
+        )
+        self.unlock_canvas.create_oval(
+            2,
+            2,
+            UNLOCK_ICON_SIZE - 2,
+            UNLOCK_ICON_SIZE - 2,
+            fill=LOCKED_ACCENT,
+            outline=LOCKED_HOVER,
+            width=2,
+        )
+        self.unlock_canvas.create_arc(
+            11,
+            8,
+            27,
+            25,
+            start=22,
+            extent=200,
+            style="arc",
+            outline="#30200A",
+            width=3,
+        )
+        self.unlock_canvas.create_rectangle(
+            12,
+            19,
+            26,
+            29,
+            fill="#30200A",
+            outline="#30200A",
+        )
+        self.unlock_canvas.create_oval(
+            18,
+            22,
+            20,
+            24,
+            fill=LOCKED_ACCENT,
+            outline=LOCKED_ACCENT,
+        )
+        self.unlock_canvas.bind(
+            "<ButtonRelease-1>",
+            lambda _event: self.set_locked(False),
+        )
 
         self._constant_styles.append((self.lock_window, {"bg": BG_TITLE}))
         self._stateful_styles[self.lock_button] = (
@@ -1864,24 +1945,27 @@ class OverlayApp:
             not self.visible
             or self.collapsed
             or self.animating
-            or self._background_hidden
-            or self.root.state() != "normal"
+            or (self._background_hidden and not self.locked)
+            or (self.root.state() != "normal" and not self.locked)
         ):
             self.lock_window.withdraw()
             return
 
-        x = (
+        slot_x = (
             self.root.winfo_x()
             + self.root.winfo_width()
             - CLOSE_AREA_WIDTH
             - LOCK_WIDTH
             - 10
         )
-        y = self.root.winfo_y() + (TITLE_HEIGHT - LOCK_HEIGHT) // 2 + 1
+        control_size = UNLOCK_ICON_SIZE if self.locked else LOCK_WIDTH
+        control_height = UNLOCK_ICON_SIZE if self.locked else LOCK_HEIGHT
+        x = slot_x + (LOCK_WIDTH - control_size) // 2
+        y = self.root.winfo_y() + (TITLE_HEIGHT - control_height) // 2 + 1
         _set_absolute_geometry(
             self.lock_window,
-            width=LOCK_WIDTH,
-            height=LOCK_HEIGHT,
+            width=control_size,
+            height=control_height,
             x=x,
             y=y,
         )
@@ -1892,7 +1976,7 @@ class OverlayApp:
 
     def update_background_for_hover(self, cursor_x: int, cursor_y: int) -> None:
         """Hide the window chrome unless the cursor is on (or near) it."""
-        if self._closed:
+        if self._closed or self.locked:
             return
         if not self.no_background.get():
             self._set_background_hidden(False)
@@ -1924,14 +2008,7 @@ class OverlayApp:
         self._background_hidden = hidden
         self._apply_background_state()
         self._apply_layered_style()
-        if hidden:
-            try:
-                if self.lock_window.winfo_exists():
-                    self.lock_window.withdraw()
-            except (AttributeError, tk.TclError):
-                pass
-        else:
-            self._sync_lock_window()
+        self._sync_lock_window()
 
     def _apply_background_state(self) -> None:
         if self._background_hidden:
@@ -1974,6 +2051,10 @@ class OverlayApp:
             self.timer_actions.pack(pady=(0, 4))
             self._apply_control_colors()
         self._apply_content_colors()
+        self.empty_note_label.configure(
+            fg=NO_BACKGROUND_MUTED if self._background_hidden else TEXT_MUTED
+        )
+        self._refresh_empty_note_label()
 
     def _apply_content_colors(self) -> None:
         text_color = NO_BACKGROUND_TEXT if self._background_hidden else TEXT
@@ -2001,6 +2082,8 @@ class OverlayApp:
         self.set_locked(not self.locked)
 
     def set_locked(self, locked: bool) -> None:
+        if self.locked == locked:
+            return
         self.locked = locked
 
         hwnd = _top_level_handle(self.root)
@@ -2025,12 +2108,29 @@ class OverlayApp:
         )
 
         self._apply_control_colors()
-        if not locked and self.visible:
-            self.root.attributes("-topmost", True)
-            self.root.lift()
-            self.root.focus_force()
-        if self._background_hidden:
-            self._apply_background_state()
+        if locked:
+            self.lock_button.pack_forget()
+            self.unlock_canvas.pack(fill="both", expand=True)
+            self.lock_window.configure(bg=TRANSPARENT_KEY)
+            self._refresh_empty_note_label()
+            if self.visible:
+                # Click-through alone still covers the target visually.
+                # Withdraw the main HWND and leave only the unlock control.
+                self.root.withdraw()
+        else:
+            self.unlock_canvas.pack_forget()
+            self.lock_button.pack(fill="both", expand=True)
+            self.lock_window.configure(bg=BG_TITLE)
+            if self.visible:
+                self.root.deiconify()
+                self.root.attributes("-topmost", True)
+                self.root.lift()
+                self.root.focus_force()
+            cursor = Point()
+            if user32.GetCursorPos(ctypes.byref(cursor)):
+                self.update_background_for_hover(cursor.x, cursor.y)
+            if self._background_hidden:
+                self._apply_background_state()
 
         self._sync_lock_window()
 
@@ -2043,13 +2143,6 @@ class OverlayApp:
             disabledforeground="#646B78",
         )
         if self.locked:
-            self.lock_button.configure(
-                text="解锁",
-                bg=LOCKED_ACCENT,
-                activebackground=LOCKED_HOVER,
-                fg="#30200A",
-                activeforeground="#30200A",
-            )
             self.status_label.configure(
                 text=f"●  {self.mode} · 已锁定",
                 bg=BG_PANEL,
@@ -2643,6 +2736,13 @@ def _self_test() -> None:
     assert app.note_text.cget("bg") == TRANSPARENT_KEY
     assert app.note_text.cget("fg") == NO_BACKGROUND_TEXT
     assert app.note_text.get("1.0", "end-1c") == "临时想法"
+    app.note_text.delete("1.0", "end")
+    app.root.update()
+    assert app.empty_note_label.winfo_manager() == "place"
+    assert app.empty_note_label.cget("text") == "空便签"
+    app.note_text.insert("1.0", "再次写入")
+    app.root.update()
+    assert app.empty_note_label.winfo_manager() == ""
     app.set_mode("待办")
     assert app.todo_entry_row.winfo_manager() == ""
     assert app.todo_actions.winfo_manager() == ""
@@ -2732,6 +2832,40 @@ def _self_test() -> None:
     assert restored_y + restored_height <= work_bottom - RESTORE_MARGIN
     app.close()
 
+    visible_lock_app = OverlayApp(visible=True)
+    visible_lock_app.root.update()
+    original_position = (
+        visible_lock_app.root.winfo_x(),
+        visible_lock_app.root.winfo_y(),
+    )
+    visible_lock_app.set_locked(True)
+    visible_lock_app.root.update()
+    assert visible_lock_app.root.state() == "withdrawn"
+    assert visible_lock_app.lock_window.state() == "normal"
+    assert visible_lock_app.unlock_canvas.winfo_manager() == "pack"
+    assert visible_lock_app.lock_button.winfo_manager() == ""
+    assert visible_lock_app.lock_window.winfo_width() == UNLOCK_ICON_SIZE
+    assert visible_lock_app.lock_window.winfo_height() == UNLOCK_ICON_SIZE
+    visible_lock_app.update_background_for_hover(*original_position)
+    visible_lock_app.root.update()
+    assert visible_lock_app.root.state() == "withdrawn", (
+        "hover unexpectedly revealed a locked window"
+    )
+    visible_lock_app.unlock_canvas.event_generate(
+        "<ButtonRelease-1>",
+        x=UNLOCK_ICON_SIZE // 2,
+        y=UNLOCK_ICON_SIZE // 2,
+    )
+    visible_lock_app.root.update()
+    assert visible_lock_app.root.state() == "normal"
+    assert visible_lock_app.lock_button.winfo_manager() == "pack"
+    assert not visible_lock_app.click_through_style_is_set()
+    assert (
+        visible_lock_app.root.winfo_x(),
+        visible_lock_app.root.winfo_y(),
+    ) == original_position
+    visible_lock_app.close()
+
     temporary_settings_directory = tempfile.TemporaryDirectory()
     test_settings_path = (
         Path(temporary_settings_directory.name) / "DesktopTools" / "settings.json"
@@ -2819,8 +2953,9 @@ def _self_test() -> None:
     temporary_settings_directory.cleanup()
     print(
         "Self-test passed: tray manager and icons, persistent settings, "
-        "four independent window modes, no-background mode, background "
-        "lifetime, lock styles, and ball collapse/restore work correctly."
+        "four independent window modes, empty-note placeholder, "
+        "no-background mode, icon-only lock, background lifetime, "
+        "and ball collapse/restore work correctly."
     )
 
 
