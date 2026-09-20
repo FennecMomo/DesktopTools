@@ -27,7 +27,7 @@ from queue import Empty, Queue
 
 
 APP_TITLE = "DesktopTools 自由窗口"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 UPDATE_MANIFEST_URL = (
     "https://raw.githubusercontent.com/FennecMomo/DesktopTools/"
     "main/dist/update.json"
@@ -49,19 +49,22 @@ UNLOCK_ICON_SIZE = 38
 CLOSE_AREA_WIDTH = 48
 BALL_SIZE = 58
 BALL_MARGIN = 6
+SHORTCUT_ICON_SIZE = 46
+SHORTCUT_ICON_GAP = 6
 RESTORE_MARGIN = 10
 EDGE_TRIGGER_DISTANCE = 28
 ANIMATION_STEPS = 10
 ANIMATION_DELAY_MS = 14
 HOVER_POLL_MS = 90
 HOVER_MARGIN = 16
-WINDOW_MODES = ("便签", "待办", "任务胶囊", "倒计时", "时钟")
+WINDOW_MODES = ("便签", "待办", "任务胶囊", "倒计时", "时钟", "快捷按键")
 MODE_HINTS = {
     "便签": "把临时想法放在手边",
     "待办": "双击切换完成；选中后可编辑或删除",
     "任务胶囊": "一次只专注当前任务",
     "倒计时": "专注、休息或提醒自己换个任务",
     "时钟": "开会或全屏工作时也能看到时间",
+    "快捷按键": "一键执行常用操作",
 }
 
 BG_OUTER = "#11141A"
@@ -82,6 +85,7 @@ TRANSPARENT_KEY = "#010203"
 
 GWL_EXSTYLE = -20
 WS_EX_TRANSPARENT = 0x00000020
+WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_NOACTIVATE = 0x08000000
 WS_EX_LAYERED = 0x00080000
 LWA_COLORKEY = 0x00000001
@@ -103,6 +107,9 @@ TRAY_CALLBACK_MESSAGE = WM_APP + 20
 QUICK_CAPTURE_HOTKEY_ID = 1
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
+GW_OWNER = 4
+SW_RESTORE = 9
+DWMWA_CLOAKED = 14
 
 NIM_ADD = 0x00000000
 NIM_DELETE = 0x00000002
@@ -239,6 +246,12 @@ WindowProcedure = ctypes.WINFUNCTYPE(
     wintypes.LPARAM,
 )
 
+EnumWindowsCallback = ctypes.WINFUNCTYPE(
+    wintypes.BOOL,
+    wintypes.HWND,
+    wintypes.LPARAM,
+)
+
 
 class WindowClassEx(ctypes.Structure):
     _fields_ = [
@@ -274,6 +287,7 @@ user32 = ctypes.WinDLL("user32", use_last_error=True)
 shell32 = ctypes.WinDLL("shell32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
 _pointer_bits = ctypes.sizeof(ctypes.c_void_p) * 8
 
 if _pointer_bits == 64:
@@ -387,6 +401,21 @@ user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
 user32.UnregisterHotKey.restype = wintypes.BOOL
 user32.GetCursorPos.argtypes = [ctypes.POINTER(Point)]
 user32.GetCursorPos.restype = wintypes.BOOL
+user32.EnumWindows.argtypes = [EnumWindowsCallback, wintypes.LPARAM]
+user32.EnumWindows.restype = wintypes.BOOL
+user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+user32.GetWindow.restype = wintypes.HWND
+user32.GetWindowThreadProcessId.argtypes = [
+    wintypes.HWND,
+    ctypes.POINTER(wintypes.DWORD),
+]
+user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+user32.GetClassNameW.restype = ctypes.c_int
+user32.IsIconic.argtypes = [wintypes.HWND]
+user32.IsIconic.restype = wintypes.BOOL
+user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.ShowWindow.restype = wintypes.BOOL
 user32.SetMenuItemInfoW.argtypes = [
     wintypes.HMENU,
     wintypes.UINT,
@@ -397,6 +426,8 @@ user32.SetMenuItemInfoW.restype = wintypes.BOOL
 
 kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
 kernel32.GetModuleHandleW.restype = wintypes.HINSTANCE
+kernel32.GetCurrentProcessId.argtypes = []
+kernel32.GetCurrentProcessId.restype = wintypes.DWORD
 shell32.Shell_NotifyIconW.argtypes = [
     wintypes.DWORD,
     ctypes.POINTER(NotifyIconData),
@@ -413,6 +444,14 @@ gdi32.CreateDIBSection.argtypes = [
 gdi32.CreateDIBSection.restype = wintypes.HBITMAP
 gdi32.DeleteObject.argtypes = [wintypes.HANDLE]
 gdi32.DeleteObject.restype = wintypes.BOOL
+
+dwmapi.DwmGetWindowAttribute.argtypes = [
+    wintypes.HWND,
+    wintypes.DWORD,
+    ctypes.c_void_p,
+    wintypes.DWORD,
+]
+dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long
 
 HWND_TOPMOST = wintypes.HWND(-1)
 
@@ -488,6 +527,59 @@ def _native_window_geometry(window: tk.Misc) -> tuple[int, int, int, int]:
         rectangle.left,
         rectangle.top,
     )
+
+
+def _is_cloaked_window(hwnd: int) -> bool:
+    """Hide windows that belong to other virtual desktops or suspended UWP apps."""
+    cloaked = wintypes.DWORD()
+    result = dwmapi.DwmGetWindowAttribute(
+        wintypes.HWND(hwnd),
+        DWMWA_CLOAKED,
+        ctypes.byref(cloaked),
+        ctypes.sizeof(cloaked),
+    )
+    return result == 0 and cloaked.value != 0
+
+
+def _switch_candidates() -> list[int]:
+    """List switchable windows in Alt+Tab-like z-order, excluding this process."""
+    own_process = kernel32.GetCurrentProcessId()
+    candidates: list[int] = []
+
+    def collect(hwnd: int, _lparam: int) -> bool:
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        if user32.GetWindow(hwnd, GW_OWNER):
+            return True
+        if int(_get_window_long(wintypes.HWND(hwnd), GWL_EXSTYLE)) & WS_EX_TOOLWINDOW:
+            return True
+        process_id = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+        if process_id.value == own_process:
+            return True
+        class_name = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(hwnd, class_name, 64)
+        if class_name.value in (
+            "Progman",
+            "WorkerW",
+            "Shell_TrayWnd",
+            "Shell_SecondaryTrayWnd",
+        ):
+            return True
+        if _is_cloaked_window(hwnd):
+            return True
+        candidates.append(int(hwnd))
+        return True
+
+    user32.EnumWindows(EnumWindowsCallback(collect), 0)
+    return candidates
+
+
+def _activate_window(hwnd: int) -> bool:
+    handle = wintypes.HWND(hwnd)
+    if user32.IsIconic(handle):
+        user32.ShowWindow(handle, SW_RESTORE)
+    return bool(user32.SetForegroundWindow(handle))
 
 
 def _colorref(color: str) -> int:
@@ -1526,6 +1618,8 @@ class OverlayApp:
         self._sync_scheduled = False
         self.mode = WINDOW_MODES[0]
         self._editing_todo_index: int | None = None
+        self._switch_targets: list[int] = []
+        self._switch_index = 0
         self._tick_after_id: str | None = None
         self.root = tk.Tk() if master is None else tk.Toplevel(master)
         if not visible or (saved_state is not None and saved_state["collapsed"]):
@@ -1563,6 +1657,7 @@ class OverlayApp:
         self.root.update_idletasks()
         self._build_lock_window()
         self._build_ball_window()
+        self._build_shortcut_window()
         self._apply_control_colors()
         if saved_state is not None:
             self.set_mode(saved_state["mode"])
@@ -2235,6 +2330,39 @@ class OverlayApp:
         )
         self.clock_date_label.pack(pady=(0, 8))
         self._register_mode_style(self.clock_date_label, bg=BG_PANEL)
+
+        shortcut_view = self.mode_views["快捷按键"]
+        self.shortcut_buttons_frame = tk.Frame(shortcut_view, bg=BG_PANEL)
+        self.shortcut_buttons_frame.pack(fill="x")
+        self._register_mode_style(self.shortcut_buttons_frame, bg=BG_PANEL)
+        self.shortcut_buttons: list[tk.Button] = []
+        for label, hint, action, _icon in self._shortcut_definitions():
+            button = tk.Button(
+                self.shortcut_buttons_frame,
+                text=f"{label}（{hint}）",
+                command=action,
+                bg=ACCENT,
+                fg="#102219",
+                activebackground=ACCENT_HOVER,
+                activeforeground="#102219",
+                relief="flat",
+                bd=0,
+                highlightthickness=0,
+                font=("Microsoft YaHei UI", 10, "bold"),
+                cursor="hand2",
+                takefocus=False,
+                pady=9,
+            )
+            button.pack(fill="x", pady=(0, 8))
+            self._register_mode_style(
+                button,
+                bg=ACCENT,
+                fg="#102219",
+                activebackground=ACCENT_HOVER,
+                activeforeground="#102219",
+            )
+            self.shortcut_buttons.append(button)
+
         self.mode_views[self.mode].pack(fill="both", expand=True)
 
         self.outlined_canvas = tk.Canvas(
@@ -2248,6 +2376,29 @@ class OverlayApp:
             "<Configure>",
             lambda _event: self._refresh_outlined_content(),
         )
+
+    def _shortcut_definitions(
+        self,
+    ) -> tuple[tuple[str, str, Callable[[], None], str], ...]:
+        """Label, key hint, action and icon kind of every shortcut button."""
+        return (
+            ("切换窗口", "Alt+Tab", self._shortcut_switch_window, "switch"),
+        )
+
+    def _shortcut_switch_window(self) -> None:
+        if self._closed:
+            return
+        candidates = _switch_candidates()
+        if not candidates:
+            return
+        if set(candidates) != set(self._switch_targets):
+            self._switch_targets = candidates
+            # The first window in z-order already sits right behind this
+            # overlay, so start cycling from the one below it and wrap around.
+            self._switch_index = 1 if len(candidates) > 1 else 0
+        else:
+            self._switch_index = (self._switch_index + 1) % len(self._switch_targets)
+        _activate_window(self._switch_targets[self._switch_index])
 
     def _show_mode_menu(self) -> None:
         if self.locked or self._background_hidden:
@@ -2292,6 +2443,7 @@ class OverlayApp:
         self.mode_views[mode].pack(fill="both", expand=True)
         self.mode_button.configure(text=f"{mode} ▾")
         self._apply_control_colors()
+        self._sync_shortcut_window()
         if self._background_hidden:
             self._apply_background_state()
         self._refresh_outlined_content()
@@ -2370,6 +2522,11 @@ class OverlayApp:
             content = (title, f"{minutes:02d}:{seconds:02d}")
         elif self.mode == "倒计时":
             content = str(self.timer_label.cget("text"))
+        elif self.mode == "快捷按键":
+            content = " · ".join(
+                f"{label}（{hint}）"
+                for label, hint, _action, _icon in self._shortcut_definitions()
+            )
         else:
             content = (
                 str(self.clock_time_label.cget("text")),
@@ -2431,6 +2588,14 @@ class OverlayApp:
                 font=("Segoe UI", 30, "bold"),
                 large=True,
             )
+        elif self.mode == "快捷按键":
+            self._draw_outlined_text(
+                content,
+                canvas_width // 2,
+                canvas_height // 2,
+                font=("Microsoft YaHei UI", 12, "bold"),
+                width=canvas_width - 24,
+            )
         else:
             clock_time, clock_date = content
             self._draw_outlined_text(
@@ -2457,6 +2622,7 @@ class OverlayApp:
             self.timer_label.pack_forget()
             self.clock_time_label.pack_forget()
             self.clock_date_label.pack_forget()
+            self.shortcut_buttons_frame.pack_forget()
             self.outlined_canvas.place(
                 relx=0,
                 rely=0,
@@ -2475,6 +2641,7 @@ class OverlayApp:
             self.timer_label.pack(expand=True)
             self.clock_time_label.pack(expand=True)
             self.clock_date_label.pack(pady=(0, 8))
+            self.shortcut_buttons_frame.pack(fill="x")
             self._outline_snapshot = None
 
     def _add_todo(self, _event: tk.Event | None = None) -> None:
@@ -2897,6 +3064,155 @@ class OverlayApp:
             outline=ACCENT,
         )
 
+    def _build_shortcut_window(self) -> None:
+        """Small icon buttons that appear below the collapsed ball."""
+        self.shortcut_window = tk.Toplevel(self.root)
+        self.shortcut_window.withdraw()
+        self.shortcut_window.overrideredirect(True)
+        self.shortcut_window.configure(bg=TRANSPARENT_KEY)
+        self.shortcut_window.attributes("-topmost", True)
+        try:
+            self.shortcut_window.attributes("-toolwindow", True)
+            self.shortcut_window.attributes("-transparentcolor", TRANSPARENT_KEY)
+        except tk.TclError:
+            pass
+
+        self.shortcut_icon_shapes: list[tuple[tk.Canvas, int]] = []
+        for label, _hint, action, icon in self._shortcut_definitions():
+            canvas = tk.Canvas(
+                self.shortcut_window,
+                width=SHORTCUT_ICON_SIZE,
+                height=SHORTCUT_ICON_SIZE,
+                bg=TRANSPARENT_KEY,
+                bd=0,
+                highlightthickness=0,
+                cursor="hand2",
+            )
+            canvas.pack(
+                pady=(SHORTCUT_ICON_GAP if self.shortcut_icon_shapes else 0, 0)
+            )
+            shape = canvas.create_oval(
+                2,
+                2,
+                SHORTCUT_ICON_SIZE - 2,
+                SHORTCUT_ICON_SIZE - 2,
+                fill=BG_TITLE,
+                outline=ACCENT,
+                width=2,
+            )
+            self._draw_shortcut_icon(canvas, icon)
+            canvas.bind(
+                "<Enter>",
+                lambda _event, target=canvas, item=shape: self._shortcut_icon_hover(
+                    target, item, True
+                ),
+            )
+            canvas.bind(
+                "<Leave>",
+                lambda _event, target=canvas, item=shape: self._shortcut_icon_hover(
+                    target, item, False
+                ),
+            )
+            canvas.bind(
+                "<ButtonRelease-1>",
+                lambda _event, run=action: run(),
+            )
+            self.shortcut_icon_shapes.append((canvas, shape))
+
+    def _shortcut_icon_hover(
+        self,
+        canvas: tk.Canvas,
+        shape: int,
+        hovered: bool,
+    ) -> None:
+        canvas.itemconfigure(
+            shape,
+            fill="#303844" if hovered else BG_TITLE,
+            outline=ACCENT_HOVER if hovered else ACCENT,
+        )
+
+    def _draw_shortcut_icon(self, canvas: tk.Canvas, kind: str) -> None:
+        unit = SHORTCUT_ICON_SIZE / 46
+        if kind == "switch":
+            canvas.create_rectangle(
+                8 * unit,
+                7 * unit,
+                26 * unit,
+                21 * unit,
+                outline=TEXT_MUTED,
+                width=2,
+            )
+            canvas.create_line(
+                8 * unit,
+                11 * unit,
+                26 * unit,
+                11 * unit,
+                fill=TEXT_MUTED,
+                width=2,
+            )
+            canvas.create_rectangle(
+                17 * unit,
+                15 * unit,
+                35 * unit,
+                29 * unit,
+                outline=ACCENT,
+                width=2,
+            )
+            canvas.create_line(
+                17 * unit,
+                19 * unit,
+                35 * unit,
+                19 * unit,
+                fill=ACCENT,
+                width=2,
+            )
+
+    def _sync_shortcut_window(self) -> None:
+        if not hasattr(self, "shortcut_window") or not self.shortcut_window.winfo_exists():
+            return
+        if (
+            not self.visible
+            or not self.collapsed
+            or self.animating
+            or self.mode != "快捷按键"
+            or self._ball_geometry is None
+            or not self.shortcut_icon_shapes
+        ):
+            self.shortcut_window.withdraw()
+            return
+
+        count = len(self.shortcut_icon_shapes)
+        height = count * SHORTCUT_ICON_SIZE + (count - 1) * SHORTCUT_ICON_GAP
+        _, _, ball_x, ball_y = self._ball_geometry
+        _monitor_area, work_area = _monitor_areas_at(
+            ball_x + BALL_SIZE // 2,
+            ball_y + BALL_SIZE // 2,
+        )
+        left, top, right, bottom = work_area
+        x = _clamp(
+            ball_x + (BALL_SIZE - SHORTCUT_ICON_SIZE) // 2,
+            left + BALL_MARGIN,
+            right - SHORTCUT_ICON_SIZE - BALL_MARGIN,
+        )
+        below_y = ball_y + BALL_SIZE + SHORTCUT_ICON_GAP
+        above_y = ball_y - height - SHORTCUT_ICON_GAP
+        if below_y + height <= bottom - BALL_MARGIN or above_y < top + BALL_MARGIN:
+            y = below_y
+        else:
+            y = above_y
+        y = _clamp(y, top + BALL_MARGIN, bottom - height - BALL_MARGIN)
+        _set_absolute_geometry(
+            self.shortcut_window,
+            width=SHORTCUT_ICON_SIZE,
+            height=height,
+            x=x,
+            y=y,
+        )
+        self.shortcut_window.deiconify()
+        self.shortcut_window.attributes("-topmost", True)
+        self.shortcut_window.lift()
+        _set_native_topmost(self.shortcut_window)
+
     def _restore_margin_pixels(self) -> int:
         try:
             return _clamp(int(self.restore_margin.get()), 0, 80)
@@ -3051,6 +3367,7 @@ class OverlayApp:
         self._dock_edge = dock_edge
         self.animating = True
         self.lock_window.withdraw()
+        self.shortcut_window.withdraw()
         self.root.minsize(1, 1)
 
         self._animate_geometry(
@@ -3076,6 +3393,7 @@ class OverlayApp:
             _set_native_topmost(self.ball_window)
         self.collapsed = True
         self.animating = False
+        self._sync_shortcut_window()
         self._notify_state_changed()
 
     def _restored_geometry_in_work_area(self) -> tuple[int, int, int, int]:
@@ -3128,6 +3446,7 @@ class OverlayApp:
         self._restore_geometry = target
         self.animating = True
         self.ball_window.withdraw()
+        self.shortcut_window.withdraw()
         self.root.minsize(1, 1)
         _set_absolute_geometry(
             self.root,
@@ -3207,6 +3526,7 @@ class OverlayApp:
 
     def _sync_lock_window(self) -> None:
         self._sync_scheduled = False
+        self._sync_shortcut_window()
         if not self.lock_window.winfo_exists():
             return
 
@@ -3461,6 +3781,11 @@ class OverlayApp:
         try:
             if self.ball_window.winfo_exists():
                 self.ball_window.destroy()
+        except (AttributeError, tk.TclError):
+            pass
+        try:
+            if self.shortcut_window.winfo_exists():
+                self.shortcut_window.destroy()
         except (AttributeError, tk.TclError):
             pass
         try:
@@ -4668,6 +4993,23 @@ def _self_test() -> None:
     assert app._timer_deadline is None
     app.set_mode("时钟")
     assert app.clock_time_label.cget("text")
+    app.set_mode("快捷按键")
+    assert len(app.shortcut_buttons) == 1
+    assert app.shortcut_buttons[0].cget("text") == "切换窗口（Alt+Tab）"
+    global _activate_window, _switch_candidates
+    assert isinstance(_switch_candidates(), list), "window list failed"
+    original_activate_window = _activate_window
+    original_switch_candidates = _switch_candidates
+    switched_windows = []
+    _switch_candidates = lambda: [101, 202, 303]
+    _activate_window = lambda hwnd: switched_windows.append(hwnd) or True
+    try:
+        for _ in range(4):
+            app.shortcut_buttons[0].invoke()
+    finally:
+        _activate_window = original_activate_window
+        _switch_candidates = original_switch_candidates
+    assert switched_windows == [202, 303, 101, 202], switched_windows
     app.set_mode("便签")
     assert app.note_text.get("1.0", "end-1c") == "临时想法"
     assert app.todo_items == [("检查切换", True)]
@@ -4739,6 +5081,9 @@ def _self_test() -> None:
     assert app.clock_time_label.cget("bg") == TRANSPARENT_KEY
     assert app.clock_time_label.winfo_manager() == ""
     assert app.clock_time_label.cget("text") in outlined_text(app)
+    app.set_mode("快捷按键")
+    assert app.shortcut_buttons_frame.winfo_manager() == ""
+    assert "切换窗口（Alt+Tab）" in outlined_text(app)
     app.set_mode("便签")
     layered_key = wintypes.DWORD()
     layered_alpha = ctypes.c_ubyte()
@@ -4773,6 +5118,7 @@ def _self_test() -> None:
     assert app.outlined_canvas.winfo_manager() == ""
     assert app.todo_entry_row.winfo_manager() == "pack"
     assert app.timer_actions.winfo_manager() == "pack"
+    assert app.shortcut_buttons_frame.winfo_manager() == "pack"
     layered_flags = wintypes.DWORD()
     assert user32.GetLayeredWindowAttributes(
         wintypes.HWND(root_handle),
@@ -4818,7 +5164,80 @@ def _self_test() -> None:
     assert restored_x >= work_left + RESTORE_MARGIN
     assert restored_y >= work_top + RESTORE_MARGIN
     assert restored_y + restored_height <= work_bottom - RESTORE_MARGIN
+    assert app.shortcut_window.state() == "withdrawn", (
+        "invisible window showed shortcut icons"
+    )
     app.close()
+
+    shortcut_app = OverlayApp(visible=True)
+    shortcut_app.set_mode("快捷按键")
+    shortcut_app.root.update()
+    assert shortcut_app.shortcut_window.state() == "withdrawn", (
+        "shortcut icons appeared before the window collapsed"
+    )
+    cursor = Point()
+    user32.GetCursorPos(ctypes.byref(cursor))
+    monitor_area, _work_area = _monitor_areas_at(cursor.x, cursor.y)
+    left, top, right, bottom = monitor_area
+    dock_target = shortcut_app._ball_target_at_edge(
+        right - 1,
+        top + (bottom - top) // 2,
+    )
+    assert dock_target is not None, "display edge was not detected"
+    ball_geometry, dock_edge = dock_target
+    shortcut_app._collapse_to_ball(ball_geometry, dock_edge)
+    deadline = time.monotonic() + 2
+    while shortcut_app.animating and time.monotonic() < deadline:
+        shortcut_app.root.update()
+        time.sleep(0.01)
+    assert shortcut_app.collapsed and not shortcut_app.animating
+    assert shortcut_app.shortcut_window.state() == "normal", (
+        "shortcut icons did not appear below the collapsed ball"
+    )
+    assert _native_window_geometry(shortcut_app.shortcut_window) == (
+        SHORTCUT_ICON_SIZE,
+        SHORTCUT_ICON_SIZE,
+        ball_geometry[2] + (BALL_SIZE - SHORTCUT_ICON_SIZE) // 2,
+        ball_geometry[3] + BALL_SIZE + SHORTCUT_ICON_GAP,
+    ), _native_window_geometry(shortcut_app.shortcut_window)
+    shortcut_app.set_mode("便签")
+    assert shortcut_app.shortcut_window.state() == "withdrawn", (
+        "shortcut icons stayed visible in another mode"
+    )
+    shortcut_app.set_mode("快捷按键")
+    assert shortcut_app.shortcut_window.state() == "normal"
+    shortcut_app._restore_from_ball()
+    deadline = time.monotonic() + 2
+    while shortcut_app.animating and time.monotonic() < deadline:
+        shortcut_app.root.update()
+        time.sleep(0.01)
+    assert not shortcut_app.collapsed and not shortcut_app.animating
+    assert shortcut_app.shortcut_window.state() == "withdrawn", (
+        "shortcut icons stayed visible after restoring the window"
+    )
+    dock_target = shortcut_app._ball_target_at_edge(
+        left + (right - left) // 2,
+        bottom - 1,
+    )
+    assert dock_target is not None, "bottom display edge was not detected"
+    ball_geometry, dock_edge = dock_target
+    assert dock_edge == "bottom"
+    shortcut_app._collapse_to_ball(ball_geometry, dock_edge)
+    deadline = time.monotonic() + 2
+    while shortcut_app.animating and time.monotonic() < deadline:
+        shortcut_app.root.update()
+        time.sleep(0.01)
+    assert shortcut_app.collapsed and not shortcut_app.animating
+    icon_width, icon_height, icon_x, icon_y = _native_window_geometry(
+        shortcut_app.shortcut_window
+    )
+    assert icon_y + icon_height == ball_geometry[3] - SHORTCUT_ICON_GAP, (
+        "shortcut icons did not move above the bottom-docked ball",
+        (icon_x, icon_y, icon_width, icon_height),
+        ball_geometry,
+    )
+    assert icon_x + icon_width <= right - BALL_MARGIN
+    shortcut_app.close()
 
     visible_lock_app = OverlayApp(visible=True)
     visible_lock_app.note_text.insert("1.0", "锁定后保留内容")
@@ -5450,7 +5869,8 @@ def _self_test() -> None:
         "per-user auto-start option, "
         "verified GitHub update index and persistent auto-update option, "
         "independent window/task ids, shared task views and legacy migration, "
-        "five window modes with persistent task focus, editable and removable todos, "
+        "six window modes with persistent task focus and a cycling window switcher, "
+        "editable and removable todos, "
         "quick capture to existing or new windows, "
         "empty-note placeholder, "
         "no-background mode, persistent content-visible click-through lock, "
