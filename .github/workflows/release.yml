@@ -43,7 +43,6 @@ jobs:
           set +e
           output=$(gh release create "$GITHUB_REF_NAME" \
             dist/DesktopTools.exe dist/update.json \
-            --repo "$GITHUB_REPOSITORY" \
             --title "DesktopTools $GITHUB_REF_NAME" \
             --notes-from-tag \
             --verify-tag 2>&1)
