@@ -15,6 +15,7 @@ jobs:
       - name: 读取发布文件
         uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: 核对标签、版本和包体摘要
@@ -39,9 +40,18 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
+          set +e
+          output=$(gh release create "$GITHUB_REF_NAME" \
             dist/DesktopTools.exe dist/update.json \
             --repo "$GITHUB_REPOSITORY" \
             --title "DesktopTools $GITHUB_REF_NAME" \
             --notes-from-tag \
-            --verify-tag
+            --verify-tag 2>&1)
+          result=$?
+          if [ "$result" -ne 0 ]; then
+            while IFS= read -r line; do
+              echo "::error::$line"
+            done <<< "$output"
+            exit "$result"
+          fi
+          printf '%s\n' "$output"
