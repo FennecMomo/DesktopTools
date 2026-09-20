@@ -1,0 +1,47 @@
+name: 发布 DesktopTools 版本
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 读取发布文件
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: 核对标签、版本和包体摘要
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          manifest = json.loads(Path("dist/update.json").read_text(encoding="utf-8"))
+          package = Path("dist/DesktopTools.exe")
+          assert os.environ["RELEASE_TAG"] == "v" + manifest["version"]
+          assert package.stat().st_size == manifest["size"]
+          assert hashlib.sha256(package.read_bytes()).hexdigest() == manifest["sha256"]
+          print("发布文件已校验：", os.environ["RELEASE_TAG"])
+          PY
+
+      - name: 发布 GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/DesktopTools.exe dist/update.json \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "DesktopTools $GITHUB_REF_NAME" \
+            --notes-from-tag \
+            --verify-tag

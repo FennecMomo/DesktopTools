@@ -1,21 +1,41 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
+import io
 import json
 import math
 import os
+import re
+import shutil
+import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tkinter as tk
+import tkinter.messagebox as messagebox
+import urllib.error
+import urllib.request
 import winreg
 from collections import deque
 from collections.abc import Callable
 from ctypes import wintypes
 from pathlib import Path
+from queue import Empty, Queue
 
 
 APP_TITLE = "DesktopTools 自由窗口"
+APP_VERSION = "1.0.0"
+UPDATE_MANIFEST_URL = (
+    "https://raw.githubusercontent.com/FennecMomo/DesktopTools/"
+    "main/dist/update.json"
+)
+UPDATE_PACKAGE_URL = (
+    "https://raw.githubusercontent.com/FennecMomo/DesktopTools/"
+    "main/dist/DesktopTools.exe"
+)
+MAX_UPDATE_BYTES = 100 * 1024 * 1024
 
 WINDOW_WIDTH = 560
 WINDOW_HEIGHT = 320
@@ -93,6 +113,7 @@ TPM_NONOTIFY = 0x0080
 TRAY_COMMAND_ADD = 1001
 TRAY_COMMAND_SETTINGS = 1002
 TRAY_COMMAND_EXIT = 1003
+TRAY_COMMAND_UPDATE = 1004
 IDI_APPLICATION = 32512
 MIIM_BITMAP = 0x00000080
 DIB_RGB_COLORS = 0
@@ -522,6 +543,7 @@ class SettingsStore:
         "edge_collapse_enabled": True,
         "restore_margin": RESTORE_MARGIN,
         "no_background": False,
+        "auto_update": False,
     }
 
     def __init__(self, path: Path | None = None) -> None:
@@ -554,11 +576,16 @@ class SettingsStore:
         if not isinstance(no_background, bool):
             no_background = self.DEFAULTS["no_background"]
 
+        auto_update = raw.get("auto_update")
+        if not isinstance(auto_update, bool):
+            auto_update = self.DEFAULTS["auto_update"]
+
         return {
             "opacity_percent": _clamp(round(opacity), 55, 100),
             "edge_collapse_enabled": edge_collapse,
             "restore_margin": _clamp(round(restore_margin), 0, 80),
             "no_background": no_background,
+            "auto_update": auto_update,
         }
 
     def save(self, settings: dict[str, int | bool]) -> None:
@@ -569,6 +596,7 @@ class SettingsStore:
             "edge_collapse_enabled": bool(settings["edge_collapse_enabled"]),
             "restore_margin": _clamp(int(settings["restore_margin"]), 0, 80),
             "no_background": bool(settings["no_background"]),
+            "auto_update": bool(settings["auto_update"]),
         }
         descriptor, temporary_name = tempfile.mkstemp(
             prefix="settings-",
@@ -648,6 +676,7 @@ class WindowStateStore:
                     "mode": mode if mode in WINDOW_MODES else WINDOW_MODES[0],
                     "geometry": list(geometry),
                     "collapsed": collapsed,
+                    "locked": item.get("locked") is True and not collapsed,
                     "ball_geometry": list(ball_geometry) if collapsed else None,
                     "dock_edge": dock_edge if collapsed else None,
                     "note": item["note"] if isinstance(item.get("note"), str) else "",
@@ -765,6 +794,185 @@ class AutoStartStore:
                 self.set_enabled(True)
 
 
+class UpdateError(Exception):
+    pass
+
+
+def _version_numbers(value: str) -> tuple[int, int, int]:
+    if not isinstance(value, str) or re.fullmatch(r"\d+\.\d+\.\d+", value) is None:
+        raise UpdateError("版本号格式无效")
+    return tuple(int(part) for part in value.split("."))
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+class UpdateClient:
+    """Read the public GitHub package index and verify a staged executable."""
+
+    def __init__(
+        self,
+        directory: Path | None = None,
+        *,
+        manifest_url: str = UPDATE_MANIFEST_URL,
+        package_url: str = UPDATE_PACKAGE_URL,
+        opener: Callable | None = None,
+    ) -> None:
+        self.directory = (
+            Path(directory)
+            if directory is not None
+            else _default_settings_path().parent / "updates"
+        )
+        self.manifest_url = manifest_url
+        self.package_url = package_url
+        self._open = opener or urllib.request.urlopen
+
+    @staticmethod
+    def _request(url: str) -> urllib.request.Request:
+        return urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": f"DesktopTools/{APP_VERSION}",
+                "Cache-Control": "no-cache",
+            },
+        )
+
+    def latest(self) -> dict[str, str | int] | None:
+        try:
+            with self._open(self._request(self.manifest_url), timeout=15) as response:
+                contents = response.read(64 * 1024 + 1)
+        except urllib.error.HTTPError as error:
+            if error.code == 404:
+                return None
+            raise UpdateError(f"GitHub 返回 HTTP {error.code}") from error
+        except (OSError, urllib.error.URLError) as error:
+            raise UpdateError(f"无法连接 GitHub：{error}") from error
+        if len(contents) > 64 * 1024:
+            raise UpdateError("版本索引过大")
+        try:
+            raw = json.loads(contents)
+        except (ValueError, UnicodeError) as error:
+            raise UpdateError("版本索引不是有效 JSON") from error
+        if not isinstance(raw, dict):
+            raise UpdateError("版本索引格式无效")
+        version = raw.get("version")
+        digest = raw.get("sha256")
+        size = raw.get("size")
+        _version_numbers(version)
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-fA-F]{64}", digest) is None:
+            raise UpdateError("版本索引缺少有效的 SHA-256")
+        if type(size) is not int or not 0 < size <= MAX_UPDATE_BYTES:
+            raise UpdateError("版本索引包含无效的文件大小")
+        return {"version": version, "sha256": digest.lower(), "size": size}
+
+    def download(self, latest: dict[str, str | int]) -> Path:
+        self.directory.mkdir(parents=True, exist_ok=True)
+        destination = self.directory / (
+            f"DesktopTools-{latest['version']}-{latest['sha256'][:12]}.exe"
+        )
+        if (
+            destination.is_file()
+            and destination.stat().st_size == latest["size"]
+            and _sha256_file(destination) == latest["sha256"]
+        ):
+            return destination
+
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix="download-",
+            suffix=".tmp",
+            dir=self.directory,
+        )
+        temporary_path = Path(temporary_name)
+        try:
+            digest = hashlib.sha256()
+            downloaded = 0
+            try:
+                with os.fdopen(descriptor, "wb") as file:
+                    with self._open(
+                        self._request(self.package_url), timeout=30
+                    ) as response:
+                        while True:
+                            chunk = response.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            if downloaded == 0 and not chunk.startswith(b"MZ"):
+                                raise UpdateError("下载内容不是 Windows EXE")
+                            downloaded += len(chunk)
+                            if downloaded > latest["size"]:
+                                raise UpdateError("下载文件大小与版本索引不符")
+                            digest.update(chunk)
+                            file.write(chunk)
+                    file.flush()
+                    os.fsync(file.fileno())
+            except (OSError, urllib.error.URLError) as error:
+                raise UpdateError(f"下载更新失败：{error}") from error
+            if downloaded != latest["size"] or digest.hexdigest() != latest["sha256"]:
+                raise UpdateError("下载文件校验失败，未安装更新")
+            os.replace(temporary_path, destination)
+            return destination
+        finally:
+            temporary_path.unlink(missing_ok=True)
+
+
+def _apply_staged_update(arguments: list[str]) -> int:
+    """Run from the verified new EXE after the old process has exited."""
+    if (
+        len(arguments) != 3
+        or arguments[2] not in ("restart", "no-restart")
+        or not getattr(sys, "frozen", False)
+    ):
+        return 2
+    target = Path(arguments[0]).resolve()
+    expected_sha256 = arguments[1].lower()
+    restart = arguments[2] == "restart"
+    staged = Path(sys.executable).resolve()
+    if (
+        target == staged
+        or target.suffix.lower() != ".exe"
+        or re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None
+        or _sha256_file(staged) != expected_sha256
+    ):
+        return 3
+
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".DesktopTools-update-",
+            suffix=".tmp",
+            dir=target.parent,
+        )
+    except OSError:
+        return 4
+    temporary_path = Path(temporary_name)
+    try:
+        with staged.open("rb") as source, os.fdopen(descriptor, "wb") as destination:
+            shutil.copyfileobj(source, destination, length=1024 * 1024)
+            destination.flush()
+            os.fsync(destination.fileno())
+        deadline = time.monotonic() + 120
+        while True:
+            try:
+                os.replace(temporary_path, target)
+                break
+            except OSError as error:
+                if getattr(error, "winerror", None) not in (5, 32, 33):
+                    raise
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.25)
+        if restart:
+            subprocess.Popen([str(target)], cwd=target.parent)
+        return 0
+    except OSError:
+        return 4
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
 def _menu_icon_color(kind: str, x: float, y: float) -> tuple[int, int, int] | None:
     center = (MENU_ICON_SIZE - 1) / 2
     dx = x - center
@@ -786,6 +994,14 @@ def _menu_icon_color(kind: str, x: float, y: float) -> tuple[int, int, int] | No
         outer_radius = 7.15 if tooth else 6.1
         if 2.25 <= radius <= outer_radius:
             return 65, 169, 224
+        return None
+
+    if kind == "update":
+        shaft = abs(dx) <= 1.0 and -5.6 <= dy <= 1.5
+        arrow = 0 <= dy <= 4.2 and abs(dx) <= dy + 0.5
+        base = 4.7 <= dy <= 5.9 and abs(dx) <= 5.2
+        if shaft or arrow or base:
+            return 94, 196, 231
         return None
 
     if kind == "exit":
@@ -861,12 +1077,14 @@ class SystemTrayIcon:
         *,
         on_add: Callable[[], None],
         on_settings: Callable[[], None],
+        on_update: Callable[[], None],
         on_exit: Callable[[], None],
         show_icon: bool = True,
     ) -> None:
         self.root = root
         self.on_add = on_add
         self.on_settings = on_settings
+        self.on_update = on_update
         self.on_exit = on_exit
         self.show_icon = show_icon
         self._cleaned = False
@@ -920,6 +1138,7 @@ class SystemTrayIcon:
         self._menu_bitmaps = {
             TRAY_COMMAND_ADD: _create_menu_bitmap("add"),
             TRAY_COMMAND_SETTINGS: _create_menu_bitmap("settings"),
+            TRAY_COMMAND_UPDATE: _create_menu_bitmap("update"),
             TRAY_COMMAND_EXIT: _create_menu_bitmap("exit"),
         }
 
@@ -976,6 +1195,7 @@ class SystemTrayIcon:
         try:
             user32.AppendMenuW(menu, MF_STRING, TRAY_COMMAND_ADD, "添加自由窗口")
             user32.AppendMenuW(menu, MF_STRING, TRAY_COMMAND_SETTINGS, "设置")
+            user32.AppendMenuW(menu, MF_STRING, TRAY_COMMAND_UPDATE, "检查更新")
             user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
             user32.AppendMenuW(menu, MF_STRING, TRAY_COMMAND_EXIT, "退出")
             self._apply_menu_bitmaps(menu)
@@ -1047,6 +1267,7 @@ class SystemTrayIcon:
         actions = {
             TRAY_COMMAND_ADD: self.on_add,
             TRAY_COMMAND_SETTINGS: self.on_settings,
+            TRAY_COMMAND_UPDATE: self.on_update,
             TRAY_COMMAND_EXIT: self.on_exit,
         }
         action = actions.get(command)
@@ -1158,6 +1379,8 @@ class OverlayApp:
             self.set_mode(saved_state["mode"])
         if saved_state is not None and saved_state["collapsed"]:
             self._restore_saved_ball(saved_state, restored_geometry)
+        if saved_state is not None and saved_state["locked"]:
+            self.set_locked(True)
 
         self.root.bind("<Configure>", self._on_main_configure, add="+")
         self.root.bind("<Escape>", lambda _event: self.close())
@@ -1241,6 +1464,7 @@ class OverlayApp:
             "mode": self.mode,
             "geometry": list(geometry),
             "collapsed": self.collapsed,
+            "locked": self.locked,
             "ball_geometry": list(self._ball_geometry) if self.collapsed else None,
             "dock_edge": self._dock_edge if self.collapsed else None,
             "note": self.note_text.get("1.0", "end-1c"),
@@ -2579,6 +2803,7 @@ class OverlayApp:
                 self._apply_background_state()
 
         self._sync_lock_window()
+        self._notify_state_changed()
 
     def _apply_control_colors(self) -> None:
         self.close_button.configure(
@@ -2678,6 +2903,7 @@ class DesktopManager:
         settings_path: Path | None = None,
         state_path: Path | None = None,
         auto_start_store: AutoStartStore | None = None,
+        update_client: UpdateClient | None = None,
     ) -> None:
         self.visible = visible
         self._exiting = False
@@ -2689,6 +2915,12 @@ class DesktopManager:
         self._window_save_after_id: str | None = None
         self._window_state_dirty = False
         self._hover_after_id: str | None = None
+        self._update_poll_after_id: str | None = None
+        self._update_queue: Queue[tuple[str, object, object, bool]] = Queue()
+        self._update_busy = False
+        self._staged_update: tuple[Path, str, str] | None = None
+        self._restart_after_update = False
+        self._update_message = f"当前版本 v{APP_VERSION}"
         self.windows: list[OverlayApp] = []
         self.settings_window: tk.Toplevel | None = None
 
@@ -2698,6 +2930,7 @@ class DesktopManager:
         self.root.protocol("WM_DELETE_WINDOW", self.exit_app)
 
         self.settings_store = SettingsStore(settings_path)
+        self.update_client = update_client or UpdateClient()
         self.auto_start_store = auto_start_store or AutoStartStore()
         try:
             self.auto_start_store.refresh_frozen_path()
@@ -2731,11 +2964,16 @@ class DesktopManager:
             master=self.root,
             value=saved_settings["no_background"],
         )
+        self.auto_update = tk.BooleanVar(
+            master=self.root,
+            value=saved_settings["auto_update"],
+        )
         for setting_variable in (
             self.opacity_percent,
             self.edge_collapse_enabled,
             self.restore_margin,
             self.no_background,
+            self.auto_update,
         ):
             setting_variable.trace_add("write", self._schedule_settings_save)
         self.no_background.trace_add("write", self._on_no_background_changed)
@@ -2747,6 +2985,7 @@ class DesktopManager:
             self.root,
             on_add=self.add_window,
             on_settings=self.open_settings,
+            on_update=self._tray_check_updates,
             on_exit=self.exit_app,
             show_icon=tray_enabled,
         )
@@ -2761,6 +3000,8 @@ class DesktopManager:
             else:
                 self.add_window(initial_position=initial_position)
         self._hover_after_id = self.root.after(HOVER_POLL_MS, self._poll_hover)
+        if self.auto_update.get() and getattr(sys, "frozen", False):
+            self.root.after(1500, lambda: self.check_for_updates(manual=False))
 
     def add_window(
         self,
@@ -3018,6 +3259,21 @@ class DesktopManager:
             highlightthickness=0,
         ).pack(fill="x", padx=18, pady=(0, 12))
 
+        tk.Checkbutton(
+            window,
+            text="自动更新（启动时检查，退出后安装）",
+            variable=self.auto_update,
+            command=self._on_auto_update_changed,
+            bg=BG_BODY,
+            fg=TEXT,
+            activebackground=BG_BODY,
+            activeforeground=TEXT,
+            selectcolor=BG_PANEL,
+            font=("Microsoft YaHei UI", 10),
+            anchor="w",
+            highlightthickness=0,
+        ).pack(fill="x", padx=18, pady=(0, 12))
+
         margin_row = tk.Frame(window, bg=BG_BODY)
         margin_row.pack(fill="x", padx=22)
         tk.Label(
@@ -3062,6 +3318,18 @@ class DesktopManager:
         self.settings_note_label.pack(fill="x", padx=22, pady=(16, 12))
         self._update_settings_note()
 
+        self.update_status_label = tk.Label(
+            window,
+            text=self._update_message,
+            bg=BG_BODY,
+            fg=TEXT_MUTED,
+            font=("Microsoft YaHei UI", 8),
+            anchor="w",
+            justify="left",
+            wraplength=350,
+        )
+        self.update_status_label.pack(fill="x", padx=22, pady=(0, 12))
+
         actions = tk.Frame(window, bg=BG_BODY)
         actions.pack(fill="x", padx=22, pady=(0, 18))
         tk.Button(
@@ -3079,6 +3347,22 @@ class DesktopManager:
             pady=6,
             cursor="hand2",
         ).pack(side="left")
+        self.update_button = tk.Button(
+            actions,
+            text="检查更新",
+            command=lambda: self.check_for_updates(manual=True),
+            bg=BG_PANEL,
+            fg=TEXT,
+            activebackground="#3A414E",
+            activeforeground=TEXT,
+            relief="flat",
+            bd=0,
+            font=("Microsoft YaHei UI", 9),
+            padx=14,
+            pady=6,
+            cursor="hand2",
+        )
+        self.update_button.pack(side="left", padx=(8, 0))
         tk.Button(
             actions,
             text="关闭",
@@ -3095,8 +3379,8 @@ class DesktopManager:
             cursor="hand2",
         ).pack(side="right")
 
-        settings_width = 400
-        settings_height = 405
+        settings_width = 450
+        settings_height = 590
         cursor = Point()
         user32.GetCursorPos(ctypes.byref(cursor))
         _monitor_area, work_area = _monitor_areas_at(cursor.x, cursor.y)
@@ -3134,6 +3418,97 @@ class DesktopManager:
         else:
             self._auto_start_error = None
         self._update_settings_note()
+
+    def _on_auto_update_changed(self) -> None:
+        if self.auto_update.get():
+            self.check_for_updates(manual=False)
+
+    def _tray_check_updates(self) -> None:
+        self.open_settings()
+        self.check_for_updates(manual=True)
+
+    def _set_update_message(self, message: str, *, error: bool = False) -> None:
+        self._update_message = message
+        if not hasattr(self, "update_status_label"):
+            return
+        try:
+            self.update_status_label.configure(
+                text=message,
+                fg=CLOSE_HOVER if error else TEXT_MUTED,
+            )
+        except tk.TclError:
+            pass
+
+    def check_for_updates(self, *, manual: bool) -> None:
+        if self._exiting or (not manual and not self.auto_update.get()):
+            return
+        if not getattr(sys, "frozen", False):
+            self._set_update_message(
+                f"当前版本 v{APP_VERSION}；更新功能仅适用于打包后的 EXE。"
+            )
+            return
+        if self._update_busy:
+            self._set_update_message("正在检查或下载更新，请稍候……")
+            return
+        self._update_busy = True
+        self._set_update_message("正在检查 GitHub 上的最新版本……")
+
+        def worker() -> None:
+            try:
+                latest = self.update_client.latest()
+                if latest is None:
+                    self._update_queue.put(("unpublished", None, None, manual))
+                    return
+                if _version_numbers(latest["version"]) <= _version_numbers(APP_VERSION):
+                    self._update_queue.put(("current", latest, None, manual))
+                    return
+                self._update_queue.put(("downloading", latest, None, manual))
+                staged = self.update_client.download(latest)
+                self._update_queue.put(("ready", latest, staged, manual))
+            except Exception as error:
+                self._update_queue.put(("error", str(error), None, manual))
+
+        threading.Thread(target=worker, daemon=True, name="DesktopToolsUpdate").start()
+        if self._update_poll_after_id is None:
+            self._update_poll_after_id = self.root.after(100, self._poll_update_queue)
+
+    def _poll_update_queue(self) -> None:
+        self._update_poll_after_id = None
+        if self._exiting:
+            return
+        while True:
+            try:
+                kind, detail, staged, manual = self._update_queue.get_nowait()
+            except Empty:
+                break
+            if kind == "downloading":
+                self._set_update_message(f"发现 v{detail['version']}，正在下载并校验……")
+                continue
+            self._update_busy = False
+            if kind == "unpublished":
+                self._set_update_message("GitHub 尚未发布更新索引，当前无法检查新版本。")
+            elif kind == "current":
+                self._set_update_message(f"当前已是最新版本 v{APP_VERSION}。")
+            elif kind == "error":
+                self._set_update_message(f"检查更新失败：{detail}", error=True)
+            elif kind == "ready":
+                version = detail["version"]
+                self._staged_update = (staged, detail["sha256"], version)
+                self._set_update_message(
+                    f"新版 v{version} 已下载并校验；退出程序后会自动安装。"
+                )
+                if manual:
+                    self.open_settings()
+                    if messagebox.askyesno(
+                        "DesktopTools 更新",
+                        f"新版 v{version} 已准备好。现在退出并安装，然后重新启动吗？",
+                        parent=self.settings_window,
+                    ):
+                        self._restart_after_update = True
+                        self.exit_app()
+                        return
+        if self._update_busy:
+            self._update_poll_after_id = self.root.after(100, self._poll_update_queue)
 
     def _update_settings_note(self) -> None:
         if not hasattr(self, "settings_note_label"):
@@ -3189,11 +3564,16 @@ class DesktopManager:
             no_background = bool(self.no_background.get())
         except tk.TclError:
             no_background = bool(SettingsStore.DEFAULTS["no_background"])
+        try:
+            auto_update = bool(self.auto_update.get())
+        except tk.TclError:
+            auto_update = bool(SettingsStore.DEFAULTS["auto_update"])
         return {
             "opacity_percent": _clamp(opacity, 55, 100),
             "edge_collapse_enabled": edge_collapse,
             "restore_margin": _clamp(restore_margin, 0, 80),
             "no_background": no_background,
+            "auto_update": auto_update,
         }
 
     def _save_settings_now(self) -> None:
@@ -3222,6 +3602,7 @@ class DesktopManager:
         self.edge_collapse_enabled.set(True)
         self.restore_margin.set(RESTORE_MARGIN)
         self.no_background.set(False)
+        self.auto_update.set(False)
         if self.auto_start.get():
             self.auto_start.set(False)
             self._on_auto_start_changed()
@@ -3255,6 +3636,12 @@ class DesktopManager:
         self._save_window_states_now()
         self._exiting = True
         self.close_settings()
+        if self._update_poll_after_id is not None:
+            try:
+                self.root.after_cancel(self._update_poll_after_id)
+            except tk.TclError:
+                pass
+            self._update_poll_after_id = None
         if self._hover_after_id is not None:
             try:
                 self.root.after_cancel(self._hover_after_id)
@@ -3271,6 +3658,23 @@ class DesktopManager:
             self.root.destroy()
         except tk.TclError:
             pass
+        if self._staged_update is not None and getattr(sys, "frozen", False):
+            staged, digest, _version = self._staged_update
+            try:
+                subprocess.Popen(
+                    [
+                        str(staged),
+                        "--apply-update",
+                        str(Path(sys.executable).resolve()),
+                        digest,
+                        "restart" if self._restart_after_update else "no-restart",
+                    ],
+                    cwd=staged.parent,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except OSError:
+                # Keep the verified staged package for the next manual attempt.
+                pass
 
     def run(self) -> None:
         self.root.mainloop()
@@ -3546,6 +3950,63 @@ def _self_test() -> None:
     test_settings_path = (
         Path(temporary_settings_directory.name) / "DesktopTools" / "settings.json"
     )
+    fake_package = b"MZ" + b"desktop-tools-update-test" * 128
+    fake_manifest = {
+        "version": "2.0.0",
+        "sha256": hashlib.sha256(fake_package).hexdigest(),
+        "size": len(fake_package),
+    }
+
+    def fake_release_opener(request: urllib.request.Request, *, timeout: int) -> io.BytesIO:
+        del timeout
+        return io.BytesIO(
+            json.dumps(fake_manifest).encode("utf-8")
+            if request.full_url.endswith("update.json")
+            else fake_package
+        )
+
+    release_client = UpdateClient(
+        directory=Path(temporary_settings_directory.name) / "updates",
+        opener=fake_release_opener,
+    )
+    assert _version_numbers("2.1.3") > _version_numbers(APP_VERSION)
+    assert release_client.latest() == fake_manifest
+    staged_test_package = release_client.download(fake_manifest)
+    assert staged_test_package.read_bytes() == fake_package
+    assert release_client.download(fake_manifest) == staged_test_package
+
+    def corrupt_package_opener(
+        request: urllib.request.Request, *, timeout: int
+    ) -> io.BytesIO:
+        del timeout
+        return io.BytesIO(
+            json.dumps(fake_manifest).encode("utf-8")
+            if request.full_url.endswith("update.json")
+            else b"MZ" + b"corrupt"
+        )
+
+    corrupt_client = UpdateClient(
+        directory=Path(temporary_settings_directory.name) / "bad-updates",
+        opener=corrupt_package_opener,
+    )
+    try:
+        corrupt_client.download(fake_manifest)
+        raise AssertionError("corrupt update was accepted")
+    except UpdateError:
+        pass
+
+    def current_manifest_opener(
+        request: urllib.request.Request, *, timeout: int
+    ) -> io.BytesIO:
+        del request, timeout
+        return io.BytesIO(
+            json.dumps({**fake_manifest, "version": APP_VERSION}).encode("utf-8")
+        )
+
+    current_client = UpdateClient(
+        directory=Path(temporary_settings_directory.name) / "current-updates",
+        opener=current_manifest_opener,
+    )
     memory_auto_start = MemoryAutoStartStore()
     assert AutoStartStore().command().startswith('"')
     manager = DesktopManager(
@@ -3554,6 +4015,7 @@ def _self_test() -> None:
         create_initial_window=False,
         settings_path=test_settings_path,
         auto_start_store=memory_auto_start,
+        update_client=current_client,
     )
     assert manager.tray.hwnd, "tray message window was not created"
     assert all(manager.tray._menu_bitmaps.values()), "tray menu icons were not created"
@@ -3562,6 +4024,7 @@ def _self_test() -> None:
     try:
         user32.AppendMenuW(test_menu, MF_STRING, TRAY_COMMAND_ADD, "添加自由窗口")
         user32.AppendMenuW(test_menu, MF_STRING, TRAY_COMMAND_SETTINGS, "设置")
+        user32.AppendMenuW(test_menu, MF_STRING, TRAY_COMMAND_UPDATE, "检查更新")
         user32.AppendMenuW(test_menu, MF_STRING, TRAY_COMMAND_EXIT, "退出")
         assert manager.tray._apply_menu_bitmaps(test_menu), (
             "tray menu icons were not attached"
@@ -3617,6 +4080,15 @@ def _self_test() -> None:
     ]
     assert saved_windows[0]["timer_minutes"] == 7
     assert saved_windows[1]["note"] == "第二扇便签"
+    assert not any(record["locked"] for record in saved_windows)
+    legacy_state = dict(saved_windows[0])
+    del legacy_state["locked"]
+    legacy_path = test_settings_path.with_name("legacy-windows.json")
+    legacy_path.write_text(
+        json.dumps({"version": 1, "windows": [legacy_state]}),
+        encoding="utf-8",
+    )
+    assert WindowStateStore(legacy_path).load()[0]["locked"] is False
     assert second_window.mode == "便签"
     assert not second_window.todo_items
     manager.tray.dispatch_command_for_test(TRAY_COMMAND_SETTINGS)
@@ -3625,6 +4097,32 @@ def _self_test() -> None:
         manager.root.update()
         time.sleep(0.01)
     assert manager.settings_window is not None
+    manager.root.update_idletasks()
+    assert manager.settings_window.winfo_reqwidth() <= 450, (
+        manager.settings_window.winfo_reqwidth()
+    )
+    assert manager.settings_window.winfo_reqheight() <= 590, (
+        f"settings controls do not fit: {manager.settings_window.winfo_reqheight()}"
+    )
+    assert manager.update_button.cget("text") == "检查更新"
+    update_controls = [
+        child
+        for child in manager.settings_window.winfo_children()
+        if isinstance(child, tk.Checkbutton)
+        and child.cget("text").startswith("自动更新")
+    ]
+    assert len(update_controls) == 1
+    assert manager.auto_update.get() is False
+    manager.tray.dispatch_command_for_test(TRAY_COMMAND_UPDATE)
+    deadline = time.monotonic() + 2
+    while (
+        "最新版本" not in manager._update_message
+        and "仅适用于" not in manager._update_message
+        and time.monotonic() < deadline
+    ):
+        manager.root.update()
+        time.sleep(0.01)
+    assert "最新版本" in manager._update_message or "仅适用于" in manager._update_message
     assert manager.auto_start.get() is False
     startup_controls = [
         child
@@ -3646,6 +4144,7 @@ def _self_test() -> None:
     manager.reset_settings()
     assert manager.opacity_percent.get() == 86
     assert manager.no_background.get() is False
+    assert manager.auto_update.get() is False
     assert manager.auto_start.get() is False
     assert memory_auto_start.saved_command is None
     manager.auto_start.set(True)
@@ -3654,6 +4153,7 @@ def _self_test() -> None:
     manager.edge_collapse_enabled.set(False)
     manager.restore_margin.set(17)
     manager.no_background.set(True)
+    manager.auto_update.set(True)
     assert first_window._background_hidden, "no-background state was not shared"
     manager._save_settings_now()
     saved_settings = json.loads(test_settings_path.read_text(encoding="utf-8"))
@@ -3661,7 +4161,18 @@ def _self_test() -> None:
     assert saved_settings["edge_collapse_enabled"] is False
     assert saved_settings["restore_margin"] == 17
     assert saved_settings["no_background"] is True
+    assert saved_settings["auto_update"] is True
     manager.close_settings()
+    second_window.set_locked(True)
+    manager.root.update()
+    assert second_window.click_through_style_is_set()
+    assert second_window.unlock_canvas.winfo_ismapped()
+    manager._save_window_states_now()
+    saved_windows = json.loads(state_path.read_text(encoding="utf-8"))["windows"]
+    assert next(
+        record for record in saved_windows
+        if record["id"] == second_window.instance_number
+    )["locked"] is True
     second_window.close()
     assert len(manager.windows) == 1, "closing one instance stopped the manager"
     first_window.close()
@@ -3673,6 +4184,24 @@ def _self_test() -> None:
     revived_second = manager.add_window()
     assert revived_second.instance_number == second_window.instance_number
     assert revived_second.note_text.get("1.0", "end-1c") == "第二扇便签"
+    assert revived_second.locked
+    assert revived_second.click_through_style_is_set()
+    assert revived_second.unlock_canvas.winfo_ismapped()
+    revived_second.unlock_canvas.event_generate(
+        "<ButtonRelease-1>",
+        x=UNLOCK_ICON_SIZE // 2,
+        y=UNLOCK_ICON_SIZE // 2,
+    )
+    manager.root.update()
+    assert not revived_second.locked
+    assert not revived_second.click_through_style_is_set()
+    manager._save_window_states_now()
+    saved_windows = json.loads(state_path.read_text(encoding="utf-8"))["windows"]
+    assert next(
+        record for record in saved_windows
+        if record["id"] == second_window.instance_number
+    )["locked"] is False
+    revived_second.set_locked(True)
     assert revived_first.instance_number == first_window.instance_number
     assert revived_first.mode == "待办"
     assert revived_first.note_text.get("1.0", "end-1c") == "第一扇便签"
@@ -3700,11 +4229,13 @@ def _self_test() -> None:
         create_initial_window=True,
         settings_path=test_settings_path,
         auto_start_store=memory_auto_start,
+        update_client=current_client,
     )
     assert reloaded_manager.opacity_percent.get() == 77
     assert reloaded_manager.edge_collapse_enabled.get() is False
     assert reloaded_manager.restore_margin.get() == 17
     assert reloaded_manager.no_background.get() is True
+    assert reloaded_manager.auto_update.get() is True
     assert reloaded_manager.auto_start.get() is True
     assert len(reloaded_manager.windows) == 2
     reloaded_by_id = {
@@ -3713,6 +4244,24 @@ def _self_test() -> None:
     reloaded_first = reloaded_by_id[first_window.instance_number]
     reloaded_second = reloaded_by_id[second_window.instance_number]
     assert reloaded_second.note_text.get("1.0", "end-1c") == "第二扇便签"
+    assert reloaded_second.locked
+    assert reloaded_second.click_through_style_is_set()
+    assert reloaded_second.unlock_canvas.winfo_ismapped()
+    assert reloaded_second._background_hidden
+    assert reloaded_second.outlined_canvas.winfo_ismapped()
+    assert "第二扇便签" in outlined_text(reloaded_second)
+    _, _, restored_x, restored_y = _native_window_geometry(reloaded_second.root)
+    reloaded_second.update_background_for_hover(restored_x + 20, restored_y + 20)
+    assert reloaded_second._background_hidden
+    assert reloaded_second.title_label.cget("text") == ""
+    reloaded_second.unlock_canvas.event_generate(
+        "<ButtonRelease-1>",
+        x=UNLOCK_ICON_SIZE // 2,
+        y=UNLOCK_ICON_SIZE // 2,
+    )
+    reloaded_manager.root.update()
+    assert not reloaded_second.locked
+    reloaded_second.set_locked(True)
     assert reloaded_first.mode == "待办"
     assert reloaded_first.todo_items == [("只属于第一个窗口", True)]
     assert reloaded_first.timer_minutes.get() == 7
@@ -3726,28 +4275,33 @@ def _self_test() -> None:
         time.sleep(0.01)
     assert not reloaded_first.collapsed
     assert _native_window_geometry(reloaded_first.root)[:2] == (470, 310)
-    reloaded_second.close()
     reloaded_first.close()
+    reloaded_second.close()
     reloaded_manager.exit_app()
     closed_reopen_manager = DesktopManager(
         tray_enabled=False,
         visible=True,
         settings_path=test_settings_path,
         auto_start_store=memory_auto_start,
+        update_client=current_client,
     )
     assert len(closed_reopen_manager.windows) == 1
     reopened = closed_reopen_manager.windows[0]
-    assert reopened.instance_number == first_window.instance_number
-    assert reopened.mode == "待办"
-    assert reopened.todo_items == [("只属于第一个窗口", True)]
+    assert reopened.instance_number == second_window.instance_number
+    assert reopened.mode == "便签"
+    assert reopened.note_text.get("1.0", "end-1c") == "第二扇便签"
+    assert reopened.locked
+    assert reopened.unlock_canvas.winfo_ismapped()
     assert closed_reopen_manager.auto_start.get() is True
     closed_reopen_manager.exit_app()
     temporary_settings_directory.cleanup()
     print(
         "Self-test passed: tray manager and icons, persistent settings and windows, "
         "per-user auto-start option, "
+        "verified GitHub update index and persistent auto-update option, "
         "four independent window modes, empty-note placeholder, "
-        "no-background mode, content-visible click-through lock, background lifetime, "
+        "no-background mode, persistent content-visible click-through lock, "
+        "background lifetime, "
         "and ball collapse/restore work correctly."
     )
 
@@ -3764,7 +4318,9 @@ def _position_from_arguments(arguments: list[str]) -> tuple[int, int] | None:
 
 
 if __name__ == "__main__":
-    if "--self-test" in sys.argv:
+    if len(sys.argv) >= 2 and sys.argv[1] == "--apply-update":
+        sys.exit(_apply_staged_update(sys.argv[2:]))
+    elif "--self-test" in sys.argv:
         _self_test()
     else:
         DesktopManager(
