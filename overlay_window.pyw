@@ -26,7 +26,7 @@ from queue import Empty, Queue
 
 
 APP_TITLE = "DesktopTools 自由窗口"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 UPDATE_MANIFEST_URL = (
     "https://raw.githubusercontent.com/FennecMomo/DesktopTools/"
     "main/dist/update.json"
@@ -931,11 +931,15 @@ def _apply_staged_update(arguments: list[str]) -> int:
     expected_sha256 = arguments[1].lower()
     restart = arguments[2] == "restart"
     staged = Path(sys.executable).resolve()
+    try:
+        staged_sha256 = _sha256_file(staged)
+    except OSError:
+        return 3
     if (
         target == staged
         or target.suffix.lower() != ".exe"
         or re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None
-        or _sha256_file(staged) != expected_sha256
+        or staged_sha256 != expected_sha256
     ):
         return 3
 
