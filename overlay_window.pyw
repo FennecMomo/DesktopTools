@@ -1390,7 +1390,6 @@ class OverlayApp:
     def _refresh_empty_note_label(self) -> None:
         show_placeholder = (
             self._background_hidden
-            and not self.locked
             and self.mode == "便签"
             and not self.note_text.get("1.0", "end-1c").strip()
         )
@@ -1946,7 +1945,7 @@ class OverlayApp:
             or self.collapsed
             or self.animating
             or (self._background_hidden and not self.locked)
-            or (self.root.state() != "normal" and not self.locked)
+            or self.root.state() != "normal"
         ):
             self.lock_window.withdraw()
             return
@@ -2112,17 +2111,15 @@ class OverlayApp:
             self.lock_button.pack_forget()
             self.unlock_canvas.pack(fill="both", expand=True)
             self.lock_window.configure(bg=TRANSPARENT_KEY)
+            # Keep the useful content visible and click-through, but suppress
+            # all chrome even when the cursor hovers over the window.
+            self._set_background_hidden(True)
             self._refresh_empty_note_label()
-            if self.visible:
-                # Click-through alone still covers the target visually.
-                # Withdraw the main HWND and leave only the unlock control.
-                self.root.withdraw()
         else:
             self.unlock_canvas.pack_forget()
             self.lock_button.pack(fill="both", expand=True)
             self.lock_window.configure(bg=BG_TITLE)
             if self.visible:
-                self.root.deiconify()
                 self.root.attributes("-topmost", True)
                 self.root.lift()
                 self.root.focus_force()
@@ -2833,6 +2830,7 @@ def _self_test() -> None:
     app.close()
 
     visible_lock_app = OverlayApp(visible=True)
+    visible_lock_app.note_text.insert("1.0", "锁定后保留内容")
     visible_lock_app.root.update()
     original_position = (
         visible_lock_app.root.winfo_x(),
@@ -2840,7 +2838,13 @@ def _self_test() -> None:
     )
     visible_lock_app.set_locked(True)
     visible_lock_app.root.update()
-    assert visible_lock_app.root.state() == "withdrawn"
+    assert visible_lock_app.root.state() == "normal"
+    assert visible_lock_app._background_hidden
+    assert visible_lock_app.click_through_style_is_set()
+    assert visible_lock_app.note_text.winfo_ismapped()
+    assert visible_lock_app.note_text.get("1.0", "end-1c") == "锁定后保留内容"
+    assert visible_lock_app.note_text.cget("fg") == NO_BACKGROUND_TEXT
+    assert visible_lock_app.title_label.cget("text") == ""
     assert visible_lock_app.lock_window.state() == "normal"
     assert visible_lock_app.unlock_canvas.winfo_manager() == "pack"
     assert visible_lock_app.lock_button.winfo_manager() == ""
@@ -2848,8 +2852,15 @@ def _self_test() -> None:
     assert visible_lock_app.lock_window.winfo_height() == UNLOCK_ICON_SIZE
     visible_lock_app.update_background_for_hover(*original_position)
     visible_lock_app.root.update()
-    assert visible_lock_app.root.state() == "withdrawn", (
-        "hover unexpectedly revealed a locked window"
+    assert visible_lock_app.root.state() == "normal"
+    assert visible_lock_app._background_hidden, (
+        "hover unexpectedly revealed locked window chrome"
+    )
+    assert visible_lock_app.title_label.cget("text") == ""
+    visible_lock_app.note_text.delete("1.0", "end")
+    visible_lock_app.root.update()
+    assert visible_lock_app.empty_note_label.winfo_ismapped(), (
+        "empty locked note became invisible"
     )
     visible_lock_app.unlock_canvas.event_generate(
         "<ButtonRelease-1>",
@@ -2864,6 +2875,15 @@ def _self_test() -> None:
         visible_lock_app.root.winfo_x(),
         visible_lock_app.root.winfo_y(),
     ) == original_position
+    visible_lock_app.no_background.set(True)
+    visible_lock_app.set_locked(True)
+    visible_lock_app.root.update()
+    assert visible_lock_app.root.state() == "normal"
+    assert visible_lock_app._background_hidden
+    assert visible_lock_app.empty_note_label.winfo_ismapped()
+    visible_lock_app.set_locked(False)
+    visible_lock_app.root.update()
+    assert visible_lock_app.root.state() == "normal"
     visible_lock_app.close()
 
     temporary_settings_directory = tempfile.TemporaryDirectory()
@@ -2954,7 +2974,7 @@ def _self_test() -> None:
     print(
         "Self-test passed: tray manager and icons, persistent settings, "
         "four independent window modes, empty-note placeholder, "
-        "no-background mode, icon-only lock, background lifetime, "
+        "no-background mode, content-visible click-through lock, background lifetime, "
         "and ball collapse/restore work correctly."
     )
 
