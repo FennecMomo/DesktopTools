@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import tkinter as tk
+import winreg
 from collections import deque
 from collections.abc import Callable
 from ctypes import wintypes
@@ -438,6 +439,22 @@ def _set_absolute_geometry(
         raise ctypes.WinError(ctypes.get_last_error())
 
 
+def _native_window_geometry(window: tk.Misc) -> tuple[int, int, int, int]:
+    """Read the actual window rectangle, including withdrawn Tk windows."""
+    rectangle = Rect()
+    if not user32.GetWindowRect(
+        wintypes.HWND(_top_level_handle(window)),
+        ctypes.byref(rectangle),
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return (
+        rectangle.right - rectangle.left,
+        rectangle.bottom - rectangle.top,
+        rectangle.left,
+        rectangle.top,
+    )
+
+
 def _colorref(color: str) -> int:
     red = int(color[1:3], 16)
     green = int(color[3:5], 16)
@@ -574,6 +591,180 @@ class SettingsStore:
             raise
 
 
+class WindowStateStore:
+    """Keep independent window snapshots outside the repository."""
+
+    def __init__(self, path: Path | None = None) -> None:
+        self.path = Path(path) if path is not None else _default_settings_path().with_name(
+            "windows.json"
+        )
+
+    def load(self) -> list[dict[str, object]]:
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return []
+        if not isinstance(raw, dict) or not isinstance(raw.get("windows"), list):
+            return []
+
+        windows: list[dict[str, object]] = []
+        seen_ids: set[int] = set()
+        for item in raw["windows"]:
+            if not isinstance(item, dict):
+                continue
+            number = item.get("id")
+            geometry = item.get("geometry")
+            if (
+                type(number) is not int
+                or number < 1
+                or number in seen_ids
+                or not self._valid_geometry(geometry)
+            ):
+                continue
+            seen_ids.add(number)
+            mode = item.get("mode")
+            timer_minutes = item.get("timer_minutes")
+            raw_todos = item.get("todos")
+            todos = []
+            if isinstance(raw_todos, list):
+                for todo in raw_todos:
+                    if (
+                        isinstance(todo, dict)
+                        and isinstance(todo.get("text"), str)
+                        and isinstance(todo.get("done"), bool)
+                    ):
+                        todos.append({"text": todo["text"], "done": todo["done"]})
+            ball_geometry = item.get("ball_geometry")
+            dock_edge = item.get("dock_edge")
+            collapsed = (
+                item.get("collapsed") is True
+                and self._valid_geometry(ball_geometry)
+                and dock_edge in ("left", "right", "top", "bottom")
+            )
+            windows.append(
+                {
+                    "id": number,
+                    "active": item.get("active") is True,
+                    "mode": mode if mode in WINDOW_MODES else WINDOW_MODES[0],
+                    "geometry": list(geometry),
+                    "collapsed": collapsed,
+                    "ball_geometry": list(ball_geometry) if collapsed else None,
+                    "dock_edge": dock_edge if collapsed else None,
+                    "note": item["note"] if isinstance(item.get("note"), str) else "",
+                    "todos": todos,
+                    "timer_minutes": (
+                        _clamp(timer_minutes, 1, 180)
+                        if type(timer_minutes) is int
+                        else 25
+                    ),
+                }
+            )
+        return windows
+
+    @staticmethod
+    def _valid_geometry(value: object) -> bool:
+        return (
+            isinstance(value, (list, tuple))
+            and len(value) == 4
+            and all(type(component) is int for component in value)
+            and value[0] > 0
+            and value[1] > 0
+        )
+
+    def save(self, windows: list[dict[str, object]]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix="windows-",
+            suffix=".tmp",
+            dir=self.path.parent,
+        )
+        temporary_path = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as file:
+                json.dump(
+                    {"version": 1, "windows": windows},
+                    file,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                file.write("\n")
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(temporary_path, self.path)
+        except BaseException:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+
+
+class AutoStartStore:
+    """Manage this user's Windows Run entry without requiring administrator rights."""
+
+    KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+    VALUE_NAME = "DesktopTools"
+
+    def command(self) -> str:
+        if getattr(sys, "frozen", False):
+            return f'"{Path(sys.executable).resolve()}"'
+        python = Path(sys.executable).resolve()
+        pythonw = python.with_name("pythonw.exe")
+        if pythonw.exists():
+            python = pythonw
+        return f'"{python}" "{Path(__file__).resolve()}"'
+
+    def get_command(self) -> str | None:
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                self.KEY_PATH,
+                0,
+                winreg.KEY_QUERY_VALUE,
+            ) as key:
+                value, _value_type = winreg.QueryValueEx(key, self.VALUE_NAME)
+        except FileNotFoundError:
+            return None
+        return value if isinstance(value, str) and value.strip() else None
+
+    def is_enabled(self) -> bool:
+        return self.get_command() is not None
+
+    def set_enabled(self, enabled: bool) -> None:
+        if enabled:
+            with winreg.CreateKeyEx(
+                winreg.HKEY_CURRENT_USER,
+                self.KEY_PATH,
+                0,
+                winreg.KEY_SET_VALUE,
+            ) as key:
+                winreg.SetValueEx(
+                    key,
+                    self.VALUE_NAME,
+                    0,
+                    winreg.REG_SZ,
+                    self.command(),
+                )
+        else:
+            try:
+                with winreg.OpenKey(
+                    winreg.HKEY_CURRENT_USER,
+                    self.KEY_PATH,
+                    0,
+                    winreg.KEY_SET_VALUE,
+                ) as key:
+                    winreg.DeleteValue(key, self.VALUE_NAME)
+            except FileNotFoundError:
+                pass
+
+    def refresh_frozen_path(self) -> None:
+        """Keep an enabled startup entry valid after the executable is moved."""
+        if getattr(sys, "frozen", False):
+            stored = self.get_command()
+            if stored is not None and stored != self.command():
+                self.set_enabled(True)
+
+
 def _menu_icon_color(kind: str, x: float, y: float) -> tuple[int, int, int] | None:
     center = (MENU_ICON_SIZE - 1) / 2
     dx = x - center
@@ -682,6 +873,7 @@ class SystemTrayIcon:
         self._icon_added = False
         self._menu_bitmaps: dict[int, int] = {}
         self._pending_actions: deque[Callable[[], None]] = deque()
+        self._drain_after_id: str | None = None
         self._instance_handle = kernel32.GetModuleHandleW(None)
         self._class_name = f"DesktopToolsTray_{id(self):x}"
         self._window_proc_callback = WindowProcedure(self._window_proc)
@@ -742,7 +934,7 @@ class SystemTrayIcon:
 
         if show_icon:
             self._add_icon()
-        self.root.after(40, self._drain_actions)
+        self._drain_after_id = self.root.after(40, self._drain_actions)
 
     def _add_icon(self) -> None:
         if not shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self._notify_data)):
@@ -832,6 +1024,7 @@ class SystemTrayIcon:
         self._pending_actions.append(action)
 
     def _drain_actions(self) -> None:
+        self._drain_after_id = None
         if self._cleaned:
             return
         while self._pending_actions:
@@ -846,7 +1039,7 @@ class SystemTrayIcon:
                 )
         if not self._cleaned:
             try:
-                self.root.after(40, self._drain_actions)
+                self._drain_after_id = self.root.after(40, self._drain_actions)
             except tk.TclError:
                 pass
 
@@ -864,6 +1057,12 @@ class SystemTrayIcon:
         if self._cleaned:
             return
         self._cleaned = True
+        if self._drain_after_id is not None:
+            try:
+                self.root.after_cancel(self._drain_after_id)
+            except tk.TclError:
+                pass
+            self._drain_after_id = None
         if self._icon_added:
             shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(self._notify_data))
             self._icon_added = False
@@ -892,10 +1091,14 @@ class OverlayApp:
         restore_margin: tk.IntVar | None = None,
         no_background: tk.BooleanVar | None = None,
         instance_number: int = 1,
+        saved_state: dict[str, object] | None = None,
+        on_state_change: Callable[["OverlayApp"], None] | None = None,
     ) -> None:
         self.visible = visible
         self.on_close = on_close
+        self.on_state_change = on_state_change
         self.instance_number = instance_number
+        self._state_ready = False
         self._closed = False
         self.locked = False
         self.collapsed = False
@@ -911,11 +1114,12 @@ class OverlayApp:
         self._sync_scheduled = False
         self.mode = WINDOW_MODES[0]
         self.todo_items: list[tuple[str, bool]] = []
+        self._timer_duration_minutes = 25
         self._timer_remaining_seconds = 25 * 60
         self._timer_deadline: float | None = None
         self._tick_after_id: str | None = None
         self.root = tk.Tk() if master is None else tk.Toplevel(master)
-        if not visible:
+        if not visible or (saved_state is not None and saved_state["collapsed"]):
             self.root.withdraw()
 
         self.opacity_percent = opacity_percent or tk.IntVar(master=self.root, value=86)
@@ -941,10 +1145,19 @@ class OverlayApp:
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
         self._build_main_window()
-        self._place_initial_window(initial_position)
+        self._restore_saved_content(saved_state)
+        restored_geometry = None
+        if saved_state is None:
+            self._place_initial_window(initial_position)
+        else:
+            restored_geometry = self._place_saved_geometry(saved_state["geometry"])
         self.root.update_idletasks()
         self._build_lock_window()
         self._build_ball_window()
+        if saved_state is not None:
+            self.set_mode(saved_state["mode"])
+        if saved_state is not None and saved_state["collapsed"]:
+            self._restore_saved_ball(saved_state, restored_geometry)
 
         self.root.bind("<Configure>", self._on_main_configure, add="+")
         self.root.bind("<Escape>", lambda _event: self.close())
@@ -954,6 +1167,93 @@ class OverlayApp:
         cursor = Point()
         user32.GetCursorPos(ctypes.byref(cursor))
         self.update_background_for_hover(cursor.x, cursor.y)
+        self._state_ready = True
+
+    def _restore_saved_content(self, saved_state: dict[str, object] | None) -> None:
+        self.timer_minutes.trace_add("write", self._on_timer_duration_changed)
+        if saved_state is None:
+            return
+        self.note_text.insert("1.0", saved_state["note"])
+        self.todo_items = [
+            (todo["text"], todo["done"])
+            for todo in saved_state["todos"]
+        ]
+        self._render_todos()
+        self.timer_minutes.set(saved_state["timer_minutes"])
+        self._timer_remaining_seconds = self._timer_duration_minutes * 60
+        self._update_timer_display()
+
+    def _place_saved_geometry(self, geometry: object) -> tuple[int, int, int, int]:
+        width, height, x, y = geometry
+        _, (left, top, right, bottom) = _monitor_areas_at(
+            x + width // 2,
+            y + height // 2,
+        )
+        margin = self._restore_margin_pixels()
+        width = min(max(MIN_WIDTH, width), max(1, right - left - 2 * margin))
+        height = min(max(MIN_HEIGHT, height), max(1, bottom - top - 2 * margin))
+        x = _clamp(x, left + margin, right - width - margin)
+        y = _clamp(y, top + margin, bottom - height - margin)
+        _set_absolute_geometry(
+            self.root,
+            width=width,
+            height=height,
+            x=x,
+            y=y,
+        )
+        return width, height, x, y
+
+    def _restore_saved_ball(
+        self,
+        saved_state: dict[str, object],
+        restored_geometry: tuple[int, int, int, int],
+    ) -> None:
+        _, _, ball_x, ball_y = saved_state["ball_geometry"]
+        _, (left, top, right, bottom) = _monitor_areas_at(
+            ball_x + BALL_SIZE // 2,
+            ball_y + BALL_SIZE // 2,
+        )
+        ball_x = _clamp(ball_x, left + BALL_MARGIN, right - BALL_SIZE - BALL_MARGIN)
+        ball_y = _clamp(ball_y, top + BALL_MARGIN, bottom - BALL_SIZE - BALL_MARGIN)
+        self._restore_geometry = restored_geometry
+        self._ball_geometry = (BALL_SIZE, BALL_SIZE, ball_x, ball_y)
+        self._dock_edge = saved_state["dock_edge"]
+        _set_absolute_geometry(
+            self.ball_window,
+            width=BALL_SIZE,
+            height=BALL_SIZE,
+            x=ball_x,
+            y=ball_y,
+        )
+        self.collapsed = True
+        if self.visible:
+            self.ball_window.deiconify()
+            _set_native_topmost(self.ball_window)
+
+    def state_snapshot(self) -> dict[str, object]:
+        if self._restore_geometry is not None and (self.collapsed or self.animating):
+            geometry = self._restore_geometry
+        else:
+            geometry = _native_window_geometry(self.root)
+        return {
+            "id": self.instance_number,
+            "active": True,
+            "mode": self.mode,
+            "geometry": list(geometry),
+            "collapsed": self.collapsed,
+            "ball_geometry": list(self._ball_geometry) if self.collapsed else None,
+            "dock_edge": self._dock_edge if self.collapsed else None,
+            "note": self.note_text.get("1.0", "end-1c"),
+            "todos": [
+                {"text": title, "done": done}
+                for title, done in self.todo_items
+            ],
+            "timer_minutes": self._timer_duration_minutes,
+        }
+
+    def _notify_state_changed(self) -> None:
+        if self._state_ready and not self._closed and self.on_state_change is not None:
+            self.on_state_change(self)
 
     def _build_main_window(self) -> None:
         border = tk.Frame(self.root, bg=BORDER, bd=0, highlightthickness=0)
@@ -1384,12 +1684,14 @@ class OverlayApp:
         if self._background_hidden:
             self._apply_background_state()
         self._refresh_outlined_content()
+        self._notify_state_changed()
 
     def _on_note_modified(self, _event: tk.Event) -> None:
         if not self.note_text.edit_modified():
             return
         self.note_text.edit_modified(False)
         self._refresh_outlined_content()
+        self._notify_state_changed()
 
     def _draw_outlined_text(
         self,
@@ -1540,6 +1842,7 @@ class OverlayApp:
         self.todo_items.append((title, False))
         self.todo_input.delete(0, "end")
         self._render_todos()
+        self._notify_state_changed()
 
     def _selected_todo_index(self) -> int | None:
         selection = self.todo_list.curselection()
@@ -1560,6 +1863,7 @@ class OverlayApp:
         title, done = self.todo_items[selected]
         self.todo_items[selected] = (title, not done)
         self._render_todos(selected)
+        self._notify_state_changed()
 
     def _delete_todo(self) -> None:
         selected = self._selected_todo_index()
@@ -1567,12 +1871,27 @@ class OverlayApp:
             return
         del self.todo_items[selected]
         self._render_todos(min(selected, len(self.todo_items) - 1))
+        self._notify_state_changed()
+
+    def _on_timer_duration_changed(self, *_trace_arguments: str) -> None:
+        try:
+            minutes = int(self.timer_minutes.get())
+        except (tk.TclError, ValueError):
+            return
+        if not 1 <= minutes <= 180:
+            return
+        self._timer_duration_minutes = minutes
+        self._notify_state_changed()
 
     def _timer_minutes_value(self) -> int:
         try:
-            return _clamp(int(self.timer_minutes.get()), 1, 180)
+            raw_minutes = int(self.timer_minutes.get())
         except (tk.TclError, ValueError):
-            return 25
+            return self._timer_duration_minutes
+        minutes = _clamp(raw_minutes, 1, 180)
+        if minutes != raw_minutes:
+            self.timer_minutes.set(minutes)
+        return minutes
 
     def _toggle_timer(self) -> None:
         if self._timer_deadline is not None:
@@ -1841,6 +2160,8 @@ class OverlayApp:
         if dock_target is not None:
             target, edge = dock_target
             self._collapse_to_ball(target, edge)
+        else:
+            self._notify_state_changed()
 
     def _begin_resize(self, event: tk.Event) -> None:
         if self.locked:
@@ -1862,6 +2183,7 @@ class OverlayApp:
 
     def _end_resize(self, _event: tk.Event) -> None:
         self._resize_origin = None
+        self._notify_state_changed()
 
     def _ball_target_at_edge(
         self,
@@ -1947,6 +2269,7 @@ class OverlayApp:
             _set_native_topmost(self.ball_window)
         self.collapsed = True
         self.animating = False
+        self._notify_state_changed()
 
     def _restored_geometry_in_work_area(self) -> tuple[int, int, int, int]:
         if self._restore_geometry is None or self._ball_geometry is None:
@@ -2023,9 +2346,12 @@ class OverlayApp:
         )
         self.collapsed = False
         self.animating = False
+        self._ball_geometry = None
+        self._dock_edge = None
         if self.visible:
             self.root.focus_force()
         self._sync_lock_window()
+        self._notify_state_changed()
 
     def _animate_geometry(
         self,
@@ -2063,7 +2389,11 @@ class OverlayApp:
         )
 
     def _on_main_configure(self, event: tk.Event) -> None:
-        if event.widget is not self.root or self._sync_scheduled:
+        if event.widget is not self.root:
+            return
+        if not self.animating and not self.collapsed:
+            self._notify_state_changed()
+        if self._sync_scheduled:
             return
         self._sync_scheduled = True
         self.root.after_idle(self._sync_lock_window)
@@ -2302,6 +2632,7 @@ class OverlayApp:
     def close(self) -> None:
         if self._closed:
             return
+        self._notify_state_changed()
         self._closed = True
         if self._tick_after_id is not None:
             try:
@@ -2345,12 +2676,19 @@ class DesktopManager:
         create_initial_window: bool = True,
         initial_position: tuple[int, int] | None = None,
         settings_path: Path | None = None,
+        state_path: Path | None = None,
+        auto_start_store: AutoStartStore | None = None,
     ) -> None:
         self.visible = visible
         self._exiting = False
-        self._next_instance_number = 1
+        self._settings_save_error = False
+        self._window_save_error = False
+        self._auto_start_error: str | None = None
         self._settings_save_after_id: str | None = None
         self._settings_dirty = False
+        self._window_save_after_id: str | None = None
+        self._window_state_dirty = False
+        self._hover_after_id: str | None = None
         self.windows: list[OverlayApp] = []
         self.settings_window: tk.Toplevel | None = None
 
@@ -2360,6 +2698,22 @@ class DesktopManager:
         self.root.protocol("WM_DELETE_WINDOW", self.exit_app)
 
         self.settings_store = SettingsStore(settings_path)
+        self.auto_start_store = auto_start_store or AutoStartStore()
+        try:
+            self.auto_start_store.refresh_frozen_path()
+            auto_start_enabled = self.auto_start_store.is_enabled()
+        except OSError as error:
+            auto_start_enabled = False
+            self._auto_start_error = f"无法读取开机启动状态：{error}"
+        self.auto_start = tk.BooleanVar(master=self.root, value=auto_start_enabled)
+        self.window_store = WindowStateStore(
+            state_path if state_path is not None else self.settings_store.path.with_name("windows.json")
+        )
+        self._window_records = self.window_store.load()
+        self._next_instance_number = max(
+            (int(record["id"]) for record in self._window_records),
+            default=0,
+        ) + 1
         saved_settings = self.settings_store.load()
         self.opacity_percent = tk.IntVar(
             master=self.root,
@@ -2398,13 +2752,28 @@ class DesktopManager:
         )
 
         if create_initial_window:
-            self.add_window(initial_position=initial_position)
-        self.root.after(HOVER_POLL_MS, self._poll_hover)
+            active_records = [
+                record for record in self._window_records if record["active"]
+            ]
+            if initial_position is None and active_records:
+                for record in active_records:
+                    self._open_window(record)
+            else:
+                self.add_window(initial_position=initial_position)
+        self._hover_after_id = self.root.after(HOVER_POLL_MS, self._poll_hover)
 
     def add_window(
         self,
         initial_position: tuple[int, int] | None = None,
     ) -> OverlayApp:
+        saved_state = None
+        if initial_position is None:
+            saved_state = next(
+                (record for record in reversed(self._window_records) if not record["active"]),
+                None,
+            )
+        if saved_state is not None:
+            return self._open_window(saved_state)
         if initial_position is None and self.windows:
             previous = self.windows[-1]
             if previous.collapsed and previous._ball_geometry is not None:
@@ -2415,6 +2784,20 @@ class DesktopManager:
                 previous_y = previous.root.winfo_y()
             initial_position = previous_x + 36, previous_y + 36
 
+        return self._open_window(None, initial_position=initial_position)
+
+    def _open_window(
+        self,
+        saved_state: dict[str, object] | None,
+        *,
+        initial_position: tuple[int, int] | None = None,
+    ) -> OverlayApp:
+        instance_number = (
+            int(saved_state["id"])
+            if saved_state is not None
+            else self._next_instance_number
+        )
+
         window = OverlayApp(
             visible=self.visible,
             initial_position=initial_position,
@@ -2424,16 +2807,77 @@ class DesktopManager:
             edge_collapse_enabled=self.edge_collapse_enabled,
             restore_margin=self.restore_margin,
             no_background=self.no_background,
-            instance_number=self._next_instance_number,
+            instance_number=instance_number,
+            saved_state=saved_state,
+            on_state_change=self._on_window_state_changed,
         )
-        self._next_instance_number += 1
+        if saved_state is None:
+            self._next_instance_number += 1
         self.windows.append(window)
+        self._on_window_state_changed(window)
+        self._save_window_states_now()
         self._update_instance_count()
         return window
+
+    def _on_window_state_changed(self, window: OverlayApp) -> None:
+        if self._exiting:
+            return
+        snapshot = window.state_snapshot()
+        for index, record in enumerate(self._window_records):
+            if record["id"] == window.instance_number:
+                if record == snapshot:
+                    return
+                self._window_records[index] = snapshot
+                break
+        else:
+            self._window_records.append(snapshot)
+        self._schedule_window_states_save()
+
+    def _schedule_window_states_save(self) -> None:
+        self._window_state_dirty = True
+        if self._window_save_after_id is not None:
+            try:
+                self.root.after_cancel(self._window_save_after_id)
+            except tk.TclError:
+                pass
+        self._window_save_after_id = self.root.after(
+            250,
+            self._save_window_states_now,
+        )
+
+    def _save_window_states_now(self) -> None:
+        pending_after = self._window_save_after_id
+        self._window_save_after_id = None
+        if pending_after is not None:
+            try:
+                self.root.after_cancel(pending_after)
+            except tk.TclError:
+                pass
+        if not self._window_state_dirty:
+            return
+        try:
+            self.window_store.save(self._window_records)
+        except OSError:
+            self._window_state_dirty = True
+            self._window_save_error = True
+            self._update_settings_note()
+            return
+        self._window_state_dirty = False
+        self._window_save_error = False
+        self._update_settings_note()
 
     def _on_window_closed(self, window: OverlayApp) -> None:
         if window in self.windows:
             self.windows.remove(window)
+        if not self._exiting:
+            for index, record in enumerate(self._window_records):
+                if record["id"] == window.instance_number:
+                    self._window_records.pop(index)
+                    record["active"] = False
+                    self._window_records.append(record)
+                    break
+            self._schedule_window_states_save()
+            self._save_window_states_now()
         self._update_instance_count()
 
     def _on_no_background_changed(self, *_trace_arguments: str) -> None:
@@ -2448,10 +2892,11 @@ class DesktopManager:
             window.update_background_for_hover(cursor.x, cursor.y)
 
     def _poll_hover(self) -> None:
+        self._hover_after_id = None
         if self._exiting:
             return
         self._refresh_backgrounds()
-        self.root.after(HOVER_POLL_MS, self._poll_hover)
+        self._hover_after_id = self.root.after(HOVER_POLL_MS, self._poll_hover)
 
     def open_settings(self) -> None:
         if self.settings_window is not None and self.settings_window.winfo_exists():
@@ -2558,6 +3003,21 @@ class DesktopManager:
             highlightthickness=0,
         ).pack(fill="x", padx=18, pady=(0, 12))
 
+        tk.Checkbutton(
+            window,
+            text="开机启动（当前 Windows 用户）",
+            variable=self.auto_start,
+            command=self._on_auto_start_changed,
+            bg=BG_BODY,
+            fg=TEXT,
+            activebackground=BG_BODY,
+            activeforeground=TEXT,
+            selectcolor=BG_PANEL,
+            font=("Microsoft YaHei UI", 10),
+            anchor="w",
+            highlightthickness=0,
+        ).pack(fill="x", padx=18, pady=(0, 12))
+
         margin_row = tk.Frame(window, bg=BG_BODY)
         margin_row.pack(fill="x", padx=22)
         tk.Label(
@@ -2591,13 +3051,16 @@ class DesktopManager:
 
         self.settings_note_label = tk.Label(
             window,
-            text="设置会自动保存到本机，并立即应用到全部实例。",
+            text="",
             bg=BG_BODY,
             fg=TEXT_MUTED,
             font=("Microsoft YaHei UI", 8),
             anchor="w",
+            justify="left",
+            wraplength=350,
         )
         self.settings_note_label.pack(fill="x", padx=22, pady=(16, 12))
+        self._update_settings_note()
 
         actions = tk.Frame(window, bg=BG_BODY)
         actions.pack(fill="x", padx=22, pady=(0, 18))
@@ -2633,7 +3096,7 @@ class DesktopManager:
         ).pack(side="right")
 
         settings_width = 400
-        settings_height = 366
+        settings_height = 405
         cursor = Point()
         user32.GetCursorPos(ctypes.byref(cursor))
         _monitor_area, work_area = _monitor_areas_at(cursor.x, cursor.y)
@@ -2660,6 +3123,40 @@ class DesktopManager:
             self.manager_opacity_value.configure(text=f"{percent}%")
         for window in tuple(self.windows):
             window.apply_shared_settings()
+
+    def _on_auto_start_changed(self) -> None:
+        enabled = bool(self.auto_start.get())
+        try:
+            self.auto_start_store.set_enabled(enabled)
+        except OSError as error:
+            self.auto_start.set(not enabled)
+            self._auto_start_error = f"开机启动设置失败：{error}"
+        else:
+            self._auto_start_error = None
+        self._update_settings_note()
+
+    def _update_settings_note(self) -> None:
+        if not hasattr(self, "settings_note_label"):
+            return
+        if self._auto_start_error:
+            message = self._auto_start_error
+        elif self._window_save_error:
+            message = "窗口存档暂时无法写入磁盘；退出前会再次尝试。"
+        elif self._settings_save_error:
+            message = "设置暂时无法写入磁盘；退出前会再次尝试。"
+        else:
+            message = "设置与窗口存档会自动保存到本机。"
+        try:
+            self.settings_note_label.configure(
+                text=message,
+                fg=CLOSE_HOVER if (
+                    self._auto_start_error
+                    or self._window_save_error
+                    or self._settings_save_error
+                ) else TEXT_MUTED,
+            )
+        except tk.TclError:
+            pass
 
     def _schedule_settings_save(self, *_trace_arguments: str) -> None:
         if self._exiting:
@@ -2713,30 +3210,21 @@ class DesktopManager:
             self.settings_store.save(self._current_settings())
         except OSError:
             self._settings_dirty = True
-            if hasattr(self, "settings_note_label"):
-                try:
-                    self.settings_note_label.configure(
-                        text="设置暂时无法写入磁盘；退出前会再次尝试。",
-                        fg=CLOSE_HOVER,
-                    )
-                except tk.TclError:
-                    pass
+            self._settings_save_error = True
+            self._update_settings_note()
             return
         self._settings_dirty = False
-        if hasattr(self, "settings_note_label"):
-            try:
-                self.settings_note_label.configure(
-                    text="设置会自动保存到本机，并立即应用到全部实例。",
-                    fg=TEXT_MUTED,
-                )
-            except tk.TclError:
-                pass
+        self._settings_save_error = False
+        self._update_settings_note()
 
     def reset_settings(self) -> None:
         self.opacity_percent.set(86)
         self.edge_collapse_enabled.set(True)
         self.restore_margin.set(RESTORE_MARGIN)
         self.no_background.set(False)
+        if self.auto_start.get():
+            self.auto_start.set(False)
+            self._on_auto_start_changed()
         self._on_opacity_changed("86")
 
     def close_settings(self) -> None:
@@ -2762,10 +3250,20 @@ class DesktopManager:
     def exit_app(self) -> None:
         if self._exiting:
             return
+        for window in tuple(self.windows):
+            self._on_window_state_changed(window)
+        self._save_window_states_now()
         self._exiting = True
         self.close_settings()
+        if self._hover_after_id is not None:
+            try:
+                self.root.after_cancel(self._hover_after_id)
+            except tk.TclError:
+                pass
+            self._hover_after_id = None
         for window in tuple(self.windows):
             window.on_close = None
+            window.on_state_change = None
             window.close()
         self.windows.clear()
         self.tray.cleanup()
@@ -2779,6 +3277,23 @@ class DesktopManager:
 
 
 def _self_test() -> None:
+    class MemoryAutoStartStore(AutoStartStore):
+        def __init__(self) -> None:
+            self.saved_command: str | None = None
+            self.fail_next = False
+
+        def get_command(self) -> str | None:
+            return self.saved_command
+
+        def set_enabled(self, enabled: bool) -> None:
+            if self.fail_next:
+                self.fail_next = False
+                raise PermissionError("test registry denial")
+            self.saved_command = self.command() if enabled else None
+
+        def refresh_frozen_path(self) -> None:
+            pass
+
     def outlined_text(window: OverlayApp) -> list[str]:
         canvas = window.outlined_canvas
         fill_items = canvas.find_withtag("outlined-fill")
@@ -3031,11 +3546,14 @@ def _self_test() -> None:
     test_settings_path = (
         Path(temporary_settings_directory.name) / "DesktopTools" / "settings.json"
     )
+    memory_auto_start = MemoryAutoStartStore()
+    assert AutoStartStore().command().startswith('"')
     manager = DesktopManager(
         tray_enabled=True,
-        visible=False,
+        visible=True,
         create_initial_window=False,
         settings_path=test_settings_path,
+        auto_start_store=memory_auto_start,
     )
     assert manager.tray.hwnd, "tray message window was not created"
     assert all(manager.tray._menu_bitmaps.values()), "tray menu icons were not created"
@@ -3062,9 +3580,43 @@ def _self_test() -> None:
         time.sleep(0.01)
     assert len(manager.windows) == 2, "manager did not create two instances"
     first_window, second_window = manager.windows
+    first_window.note_text.insert("1.0", "第一扇便签")
     first_window.set_mode("待办")
     first_window.todo_input.insert(0, "只属于第一个窗口")
     first_window._add_todo()
+    first_window.todo_list.selection_set(0)
+    first_window._toggle_todo()
+    first_window.timer_minutes.set(7)
+    second_window.note_text.insert("1.0", "第二扇便签")
+    _, test_work_area = _monitor_areas_at(
+        first_window.root.winfo_x(), first_window.root.winfo_y()
+    )
+    test_x, test_y = test_work_area[0] + 80, test_work_area[1] + 80
+    _set_absolute_geometry(
+        first_window.root,
+        width=470,
+        height=310,
+        x=test_x,
+        y=test_y,
+    )
+    manager.root.update()
+    first_window._notify_state_changed()
+    state_path = test_settings_path.with_name("windows.json")
+    deadline = time.monotonic() + 1
+    while manager._window_state_dirty and time.monotonic() < deadline:
+        manager.root.update()
+        time.sleep(0.01)
+    assert not manager._window_state_dirty, "window edits were not saved automatically"
+    saved_windows = json.loads(state_path.read_text(encoding="utf-8"))["windows"]
+    assert len(saved_windows) == 2
+    assert saved_windows[0]["mode"] == "待办"
+    assert saved_windows[0]["geometry"] == [470, 310, test_x, test_y], saved_windows[0]["geometry"]
+    assert saved_windows[0]["note"] == "第一扇便签"
+    assert saved_windows[0]["todos"] == [
+        {"text": "只属于第一个窗口", "done": True}
+    ]
+    assert saved_windows[0]["timer_minutes"] == 7
+    assert saved_windows[1]["note"] == "第二扇便签"
     assert second_window.mode == "便签"
     assert not second_window.todo_items
     manager.tray.dispatch_command_for_test(TRAY_COMMAND_SETTINGS)
@@ -3073,12 +3625,31 @@ def _self_test() -> None:
         manager.root.update()
         time.sleep(0.01)
     assert manager.settings_window is not None
+    assert manager.auto_start.get() is False
+    startup_controls = [
+        child
+        for child in manager.settings_window.winfo_children()
+        if isinstance(child, tk.Checkbutton)
+        and child.cget("text").startswith("开机启动")
+    ]
+    assert len(startup_controls) == 1
+    memory_auto_start.fail_next = True
+    startup_controls[0].invoke()
+    assert manager.auto_start.get() is False
+    assert memory_auto_start.saved_command is None
+    startup_controls[0].invoke()
+    assert manager.auto_start.get() is True
+    assert memory_auto_start.saved_command == memory_auto_start.command()
     manager._on_opacity_changed("73")
     assert abs(float(first_window.root.attributes("-alpha")) - 0.73) < 0.01
     assert abs(float(second_window.root.attributes("-alpha")) - 0.73) < 0.01
     manager.reset_settings()
     assert manager.opacity_percent.get() == 86
     assert manager.no_background.get() is False
+    assert manager.auto_start.get() is False
+    assert memory_auto_start.saved_command is None
+    manager.auto_start.set(True)
+    manager._on_auto_start_changed()
     manager.opacity_percent.set(77)
     manager.edge_collapse_enabled.set(False)
     manager.restore_margin.set(17)
@@ -3091,29 +3662,90 @@ def _self_test() -> None:
     assert saved_settings["restore_margin"] == 17
     assert saved_settings["no_background"] is True
     manager.close_settings()
-    first_window.close()
-    assert len(manager.windows) == 1, "closing one instance stopped the manager"
     second_window.close()
+    assert len(manager.windows) == 1, "closing one instance stopped the manager"
+    first_window.close()
     assert len(manager.windows) == 0, "closed instance remained registered"
     assert manager.root.winfo_exists(), "manager stopped with the last instance"
+    saved_windows = json.loads(state_path.read_text(encoding="utf-8"))["windows"]
+    assert not any(record["active"] for record in saved_windows)
+    revived_first = manager.add_window()
+    revived_second = manager.add_window()
+    assert revived_second.instance_number == second_window.instance_number
+    assert revived_second.note_text.get("1.0", "end-1c") == "第二扇便签"
+    assert revived_first.instance_number == first_window.instance_number
+    assert revived_first.mode == "待办"
+    assert revived_first.note_text.get("1.0", "end-1c") == "第一扇便签"
+    assert revived_first.todo_items == [("只属于第一个窗口", True)]
+    assert revived_first.timer_minutes.get() == 7
+    assert _native_window_geometry(revived_first.root) == (
+        470, 310, test_x, test_y
+    ), _native_window_geometry(revived_first.root)
+    test_ball, test_edge = revived_first._ball_target_at_edge(
+        test_work_area[2] - 1, test_work_area[1] + 150
+    )
+    revived_first._collapse_to_ball(test_ball, test_edge)
+    deadline = time.monotonic() + 2
+    while revived_first.animating and time.monotonic() < deadline:
+        manager.root.update()
+        time.sleep(0.01)
+    assert revived_first.collapsed
     manager.open_settings()
     assert manager.settings_window is not None
     manager.exit_app()
 
     reloaded_manager = DesktopManager(
         tray_enabled=False,
-        visible=False,
-        create_initial_window=False,
+        visible=True,
+        create_initial_window=True,
         settings_path=test_settings_path,
+        auto_start_store=memory_auto_start,
     )
     assert reloaded_manager.opacity_percent.get() == 77
     assert reloaded_manager.edge_collapse_enabled.get() is False
     assert reloaded_manager.restore_margin.get() == 17
     assert reloaded_manager.no_background.get() is True
+    assert reloaded_manager.auto_start.get() is True
+    assert len(reloaded_manager.windows) == 2
+    reloaded_by_id = {
+        window.instance_number: window for window in reloaded_manager.windows
+    }
+    reloaded_first = reloaded_by_id[first_window.instance_number]
+    reloaded_second = reloaded_by_id[second_window.instance_number]
+    assert reloaded_second.note_text.get("1.0", "end-1c") == "第二扇便签"
+    assert reloaded_first.mode == "待办"
+    assert reloaded_first.todo_items == [("只属于第一个窗口", True)]
+    assert reloaded_first.timer_minutes.get() == 7
+    assert reloaded_first.collapsed
+    assert reloaded_first._ball_geometry == test_ball
+    assert reloaded_first.ball_window.state() == "normal"
+    reloaded_first._restore_from_ball()
+    deadline = time.monotonic() + 2
+    while reloaded_first.animating and time.monotonic() < deadline:
+        reloaded_manager.root.update()
+        time.sleep(0.01)
+    assert not reloaded_first.collapsed
+    assert _native_window_geometry(reloaded_first.root)[:2] == (470, 310)
+    reloaded_second.close()
+    reloaded_first.close()
     reloaded_manager.exit_app()
+    closed_reopen_manager = DesktopManager(
+        tray_enabled=False,
+        visible=True,
+        settings_path=test_settings_path,
+        auto_start_store=memory_auto_start,
+    )
+    assert len(closed_reopen_manager.windows) == 1
+    reopened = closed_reopen_manager.windows[0]
+    assert reopened.instance_number == first_window.instance_number
+    assert reopened.mode == "待办"
+    assert reopened.todo_items == [("只属于第一个窗口", True)]
+    assert closed_reopen_manager.auto_start.get() is True
+    closed_reopen_manager.exit_app()
     temporary_settings_directory.cleanup()
     print(
-        "Self-test passed: tray manager and icons, persistent settings, "
+        "Self-test passed: tray manager and icons, persistent settings and windows, "
+        "per-user auto-start option, "
         "four independent window modes, empty-note placeholder, "
         "no-background mode, content-visible click-through lock, background lifetime, "
         "and ball collapse/restore work correctly."
