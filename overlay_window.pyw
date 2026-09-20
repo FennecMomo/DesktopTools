@@ -15,6 +15,7 @@ import threading
 import time
 import tkinter as tk
 import tkinter.messagebox as messagebox
+import tkinter.simpledialog as simpledialog
 import urllib.error
 import urllib.request
 import winreg
@@ -26,7 +27,7 @@ from queue import Empty, Queue
 
 
 APP_TITLE = "DesktopTools 自由窗口"
-APP_VERSION = "1.1.0"
+APP_VERSION = "2.0.0"
 UPDATE_MANIFEST_URL = (
     "https://raw.githubusercontent.com/FennecMomo/DesktopTools/"
     "main/dist/update.json"
@@ -54,10 +55,11 @@ ANIMATION_STEPS = 10
 ANIMATION_DELAY_MS = 14
 HOVER_POLL_MS = 90
 HOVER_MARGIN = 16
-WINDOW_MODES = ("便签", "待办", "倒计时", "时钟")
+WINDOW_MODES = ("便签", "待办", "任务胶囊", "倒计时", "时钟")
 MODE_HINTS = {
     "便签": "把临时想法放在手边",
     "待办": "双击切换完成；选中后可编辑或删除",
+    "任务胶囊": "一次只专注当前任务",
     "倒计时": "专注、休息或提醒自己换个任务",
     "时钟": "开会或全屏工作时也能看到时间",
 }
@@ -95,14 +97,21 @@ WM_DESTROY = 0x0002
 WM_CONTEXTMENU = 0x007B
 WM_LBUTTONDBLCLK = 0x0203
 WM_RBUTTONUP = 0x0205
+WM_HOTKEY = 0x0312
 WM_APP = 0x8000
 TRAY_CALLBACK_MESSAGE = WM_APP + 20
+QUICK_CAPTURE_HOTKEY_ID = 1
+MOD_ALT = 0x0001
+MOD_CONTROL = 0x0002
 
 NIM_ADD = 0x00000000
 NIM_DELETE = 0x00000002
+NIM_MODIFY = 0x00000001
 NIF_MESSAGE = 0x00000001
 NIF_ICON = 0x00000002
 NIF_TIP = 0x00000004
+NIF_INFO = 0x00000010
+NIIF_INFO = 0x00000001
 
 MF_STRING = 0x00000000
 MF_SEPARATOR = 0x00000800
@@ -114,6 +123,7 @@ TRAY_COMMAND_ADD = 1001
 TRAY_COMMAND_SETTINGS = 1002
 TRAY_COMMAND_EXIT = 1003
 TRAY_COMMAND_UPDATE = 1004
+TRAY_COMMAND_CAPTURE = 1005
 IDI_APPLICATION = 32512
 MIIM_BITMAP = 0x00000080
 DIB_RGB_COLORS = 0
@@ -371,6 +381,10 @@ user32.PostMessageW.argtypes = [
 user32.PostMessageW.restype = wintypes.BOOL
 user32.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
 user32.RegisterWindowMessageW.restype = wintypes.UINT
+user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
+user32.RegisterHotKey.restype = wintypes.BOOL
+user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.UnregisterHotKey.restype = wintypes.BOOL
 user32.GetCursorPos.argtypes = [ctypes.POINTER(Point)]
 user32.GetCursorPos.restype = wintypes.BOOL
 user32.SetMenuItemInfoW.argtypes = [
@@ -619,8 +633,73 @@ class SettingsStore:
             raise
 
 
+class TaskState:
+    """Content and timers shared by every window bound to one task number."""
+
+    def __init__(self, task_id: int) -> None:
+        self.id = task_id
+        self.note = ""
+        self.todos: list[tuple[str, bool]] = []
+        self.focus_task_index: int | None = None
+        self.focus_status = "ready"
+        self.focus_remaining_seconds: float = 25 * 60
+        self.focus_deadline: float | None = None
+        self.timer_minutes = 25
+        self.timer_remaining_seconds: float = 25 * 60
+        self.timer_deadline: float | None = None
+        self.timer_status = "ready"
+
+    @classmethod
+    def from_record(cls, task_id: int, record: dict[str, object]) -> "TaskState":
+        task = cls(task_id)
+        task.note = record.get("note") if isinstance(record.get("note"), str) else ""
+        raw_todos = record.get("todos")
+        if isinstance(raw_todos, list):
+            task.todos = [
+                (item["text"], item["done"])
+                for item in raw_todos
+                if isinstance(item, dict)
+                and isinstance(item.get("text"), str)
+                and isinstance(item.get("done"), bool)
+            ]
+        minutes = record.get("timer_minutes")
+        if type(minutes) is int:
+            task.timer_minutes = _clamp(minutes, 1, 180)
+        task.timer_remaining_seconds = task.timer_minutes * 60
+        focus_index = record.get("focus_task_index")
+        if type(focus_index) is int and 0 <= focus_index < len(task.todos):
+            task.focus_task_index = focus_index
+            status = record.get("focus_status")
+            if status in ("running", "paused", "finished"):
+                task.focus_status = "paused" if status == "running" else status
+        remaining = record.get("focus_remaining_seconds")
+        if type(remaining) in (int, float) and math.isfinite(remaining):
+            task.focus_remaining_seconds = _clamp(round(remaining), 0, 180 * 60)
+        else:
+            task.focus_remaining_seconds = task.timer_minutes * 60
+        return task
+
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "id": self.id,
+            "note": self.note,
+            "todos": [
+                {"text": title, "done": done} for title, done in self.todos
+            ],
+            "focus_task_index": self.focus_task_index,
+            "focus_status": self.focus_status,
+            "focus_remaining_seconds": (
+                max(0, math.ceil(self.focus_deadline - time.monotonic()))
+                if self.focus_deadline is not None
+                else max(0, math.ceil(self.focus_remaining_seconds))
+            ),
+            "timer_minutes": self.timer_minutes,
+            "timer_status": self.timer_status,
+        }
+
+
 class WindowStateStore:
-    """Keep independent window snapshots outside the repository."""
+    """Persist window presentation separately from shared task content."""
 
     def __init__(self, path: Path | None = None) -> None:
         self.path = Path(path) if path is not None else _default_settings_path().with_name(
@@ -636,6 +715,7 @@ class WindowStateStore:
             return []
 
         windows: list[dict[str, object]] = []
+        has_tasks = isinstance(raw.get("tasks"), list)
         seen_ids: set[int] = set()
         for item in raw["windows"]:
             if not isinstance(item, dict):
@@ -651,6 +731,9 @@ class WindowStateStore:
                 continue
             seen_ids.add(number)
             mode = item.get("mode")
+            task_id = item.get("task_id")
+            if type(task_id) is not int or task_id < 1:
+                task_id = number
             timer_minutes = item.get("timer_minutes")
             raw_todos = item.get("todos")
             todos = []
@@ -662,6 +745,22 @@ class WindowStateStore:
                         and isinstance(todo.get("done"), bool)
                     ):
                         todos.append({"text": todo["text"], "done": todo["done"]})
+            focus_index = item.get("focus_task_index")
+            if type(focus_index) is not int or not 0 <= focus_index < len(todos):
+                focus_index = None
+            focus_status = item.get("focus_status")
+            if focus_status not in ("ready", "running", "paused", "finished"):
+                focus_status = "ready"
+            raw_remaining = item.get("focus_remaining_seconds")
+            default_remaining = (
+                _clamp(timer_minutes, 1, 180) if type(timer_minutes) is int else 25
+            ) * 60
+            focus_remaining = (
+                _clamp(round(raw_remaining), 0, 180 * 60)
+                if type(raw_remaining) in (int, float)
+                and math.isfinite(raw_remaining)
+                else default_remaining
+            )
             ball_geometry = item.get("ball_geometry")
             dock_edge = item.get("dock_edge")
             collapsed = (
@@ -669,26 +768,55 @@ class WindowStateStore:
                 and self._valid_geometry(ball_geometry)
                 and dock_edge in ("left", "right", "top", "bottom")
             )
-            windows.append(
-                {
-                    "id": number,
-                    "active": item.get("active") is True,
-                    "mode": mode if mode in WINDOW_MODES else WINDOW_MODES[0],
-                    "geometry": list(geometry),
-                    "collapsed": collapsed,
-                    "locked": item.get("locked") is True and not collapsed,
-                    "ball_geometry": list(ball_geometry) if collapsed else None,
-                    "dock_edge": dock_edge if collapsed else None,
-                    "note": item["note"] if isinstance(item.get("note"), str) else "",
-                    "todos": todos,
-                    "timer_minutes": (
-                        _clamp(timer_minutes, 1, 180)
-                        if type(timer_minutes) is int
-                        else 25
-                    ),
-                }
-            )
+            window_record = {
+                "id": number,
+                "task_id": task_id,
+                "active": item.get("active") is True,
+                "mode": (
+                    "待办" if not has_tasks and mode == "任务胶囊" and focus_index is None
+                    else mode if mode in WINDOW_MODES else WINDOW_MODES[0]
+                ),
+                "geometry": list(geometry),
+                "collapsed": collapsed,
+                "locked": item.get("locked") is True and not collapsed,
+                "ball_geometry": list(ball_geometry) if collapsed else None,
+                "dock_edge": dock_edge if collapsed else None,
+            }
+            if not has_tasks:
+                window_record.update(
+                    {
+                        "note": item["note"] if isinstance(item.get("note"), str) else "",
+                        "todos": todos,
+                        "focus_task_index": focus_index,
+                        "focus_status": focus_status if focus_index is not None else "ready",
+                        "focus_remaining_seconds": focus_remaining,
+                        "timer_minutes": (
+                            _clamp(timer_minutes, 1, 180)
+                            if type(timer_minutes) is int else 25
+                        ),
+                    }
+                )
+            windows.append(window_record)
         return windows
+
+    def load_tasks(self) -> list[dict[str, object]] | None:
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(raw, dict) or not isinstance(raw.get("tasks"), list):
+            return None
+        tasks: list[dict[str, object]] = []
+        seen_ids: set[int] = set()
+        for item in raw["tasks"]:
+            if not isinstance(item, dict):
+                continue
+            task_id = item.get("id")
+            if type(task_id) is not int or task_id < 1 or task_id in seen_ids:
+                continue
+            seen_ids.add(task_id)
+            tasks.append(TaskState.from_record(task_id, item).snapshot())
+        return tasks
 
     @staticmethod
     def _valid_geometry(value: object) -> bool:
@@ -700,7 +828,11 @@ class WindowStateStore:
             and value[1] > 0
         )
 
-    def save(self, windows: list[dict[str, object]]) -> None:
+    def save(
+        self,
+        windows: list[dict[str, object]],
+        tasks: list[dict[str, object]],
+    ) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         descriptor, temporary_name = tempfile.mkstemp(
             prefix="windows-",
@@ -711,7 +843,7 @@ class WindowStateStore:
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as file:
                 json.dump(
-                    {"version": 1, "windows": windows},
+                    {"version": 2, "windows": windows, "tasks": tasks},
                     file,
                     ensure_ascii=False,
                     indent=2,
@@ -1008,6 +1140,12 @@ def _menu_icon_color(kind: str, x: float, y: float) -> tuple[int, int, int] | No
             return 94, 196, 231
         return None
 
+    if kind == "capture":
+        if -5 <= dx <= 5 and -5 <= dy <= 5:
+            if abs(dx) >= 4 or abs(dy) >= 4 or (dx >= 1 and dy >= 1):
+                return 245, 184, 92
+        return None
+
     if kind == "exit":
         ring_center_y = 8.25
         ring_dx = x - center
@@ -1082,6 +1220,7 @@ class SystemTrayIcon:
         on_add: Callable[[], None],
         on_settings: Callable[[], None],
         on_update: Callable[[], None],
+        on_capture: Callable[[], None],
         on_exit: Callable[[], None],
         show_icon: bool = True,
     ) -> None:
@@ -1089,10 +1228,12 @@ class SystemTrayIcon:
         self.on_add = on_add
         self.on_settings = on_settings
         self.on_update = on_update
+        self.on_capture = on_capture
         self.on_exit = on_exit
         self.show_icon = show_icon
         self._cleaned = False
         self._icon_added = False
+        self.hotkey_registered = False
         self._menu_bitmaps: dict[int, int] = {}
         self._pending_actions: deque[Callable[[], None]] = deque()
         self._drain_after_id: str | None = None
@@ -1143,6 +1284,7 @@ class SystemTrayIcon:
             TRAY_COMMAND_ADD: _create_menu_bitmap("add"),
             TRAY_COMMAND_SETTINGS: _create_menu_bitmap("settings"),
             TRAY_COMMAND_UPDATE: _create_menu_bitmap("update"),
+            TRAY_COMMAND_CAPTURE: _create_menu_bitmap("capture"),
             TRAY_COMMAND_EXIT: _create_menu_bitmap("exit"),
         }
 
@@ -1157,12 +1299,33 @@ class SystemTrayIcon:
 
         if show_icon:
             self._add_icon()
+            self.hotkey_registered = bool(
+                user32.RegisterHotKey(
+                    self.hwnd,
+                    QUICK_CAPTURE_HOTKEY_ID,
+                    MOD_CONTROL | MOD_ALT,
+                    ord("D"),
+                )
+            )
         self._drain_after_id = self.root.after(40, self._drain_actions)
 
     def _add_icon(self) -> None:
         if not shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self._notify_data)):
             raise RuntimeError("无法创建系统托盘图标")
         self._icon_added = True
+
+    def notify(self, title: str, message: str) -> None:
+        if not self._icon_added:
+            return
+        notice = NotifyIconData()
+        notice.cbSize = ctypes.sizeof(NotifyIconData)
+        notice.hWnd = self.hwnd
+        notice.uID = 1
+        notice.uFlags = NIF_INFO
+        notice.szInfoTitle = title[:63]
+        notice.szInfo = message[:255]
+        notice.dwInfoFlags = NIIF_INFO
+        shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(notice))
 
     def _window_proc(
         self,
@@ -1187,6 +1350,10 @@ class SystemTrayIcon:
                 self._schedule(self.on_add)
                 return 0
 
+        if message == WM_HOTKEY and int(w_param) == QUICK_CAPTURE_HOTKEY_ID:
+            self._schedule(self.on_capture)
+            return 0
+
         if message == WM_DESTROY:
             return 0
 
@@ -1198,6 +1365,11 @@ class SystemTrayIcon:
             return
         try:
             user32.AppendMenuW(menu, MF_STRING, TRAY_COMMAND_ADD, "添加自由窗口")
+            capture_label = (
+                "快速收集（Ctrl+Alt+D）"
+                if self.hotkey_registered else "快速收集（快捷键被占用）"
+            )
+            user32.AppendMenuW(menu, MF_STRING, TRAY_COMMAND_CAPTURE, capture_label)
             user32.AppendMenuW(menu, MF_STRING, TRAY_COMMAND_SETTINGS, "设置")
             user32.AppendMenuW(menu, MF_STRING, TRAY_COMMAND_UPDATE, "检查更新")
             user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
@@ -1272,6 +1444,7 @@ class SystemTrayIcon:
             TRAY_COMMAND_ADD: self.on_add,
             TRAY_COMMAND_SETTINGS: self.on_settings,
             TRAY_COMMAND_UPDATE: self.on_update,
+            TRAY_COMMAND_CAPTURE: self.on_capture,
             TRAY_COMMAND_EXIT: self.on_exit,
         }
         action = actions.get(command)
@@ -1282,6 +1455,9 @@ class SystemTrayIcon:
         if self._cleaned:
             return
         self._cleaned = True
+        if self.hotkey_registered:
+            user32.UnregisterHotKey(self.hwnd, QUICK_CAPTURE_HOTKEY_ID)
+            self.hotkey_registered = False
         if self._drain_after_id is not None:
             try:
                 self.root.after_cancel(self._drain_after_id)
@@ -1317,12 +1493,23 @@ class OverlayApp:
         no_background: tk.BooleanVar | None = None,
         instance_number: int = 1,
         saved_state: dict[str, object] | None = None,
+        task: TaskState | None = None,
         on_state_change: Callable[["OverlayApp"], None] | None = None,
+        on_focus_complete: Callable[["OverlayApp"], None] | None = None,
+        on_open_focus: Callable[["OverlayApp"], None] | None = None,
+        on_bind_task: Callable[["OverlayApp", int], None] | None = None,
+        on_list_tasks: Callable[[], list[int]] | None = None,
     ) -> None:
         self.visible = visible
         self.on_close = on_close
         self.on_state_change = on_state_change
+        self.on_focus_complete = on_focus_complete
+        self.on_open_focus = on_open_focus
+        self.on_bind_task = on_bind_task
+        self.on_list_tasks = on_list_tasks
         self.instance_number = instance_number
+        self.task = task or TaskState(instance_number)
+        self._syncing_task = False
         self._state_ready = False
         self._closed = False
         self.locked = False
@@ -1338,11 +1525,7 @@ class OverlayApp:
         self._dock_edge: str | None = None
         self._sync_scheduled = False
         self.mode = WINDOW_MODES[0]
-        self.todo_items: list[tuple[str, bool]] = []
         self._editing_todo_index: int | None = None
-        self._timer_duration_minutes = 25
-        self._timer_remaining_seconds = 25 * 60
-        self._timer_deadline: float | None = None
         self._tick_after_id: str | None = None
         self.root = tk.Tk() if master is None else tk.Toplevel(master)
         if not visible or (saved_state is not None and saved_state["collapsed"]):
@@ -1380,6 +1563,7 @@ class OverlayApp:
         self.root.update_idletasks()
         self._build_lock_window()
         self._build_ball_window()
+        self._apply_control_colors()
         if saved_state is not None:
             self.set_mode(saved_state["mode"])
         if saved_state is not None and saved_state["collapsed"]:
@@ -1397,19 +1581,112 @@ class OverlayApp:
         self.update_background_for_hover(cursor.x, cursor.y)
         self._state_ready = True
 
+    @property
+    def task_id(self) -> int:
+        return self.task.id
+
+    @property
+    def todo_items(self) -> list[tuple[str, bool]]:
+        return self.task.todos
+
+    @todo_items.setter
+    def todo_items(self, value: list[tuple[str, bool]]) -> None:
+        self.task.todos = value
+
+    @property
+    def _focus_task_index(self) -> int | None:
+        return self.task.focus_task_index
+
+    @_focus_task_index.setter
+    def _focus_task_index(self, value: int | None) -> None:
+        self.task.focus_task_index = value
+
+    @property
+    def _focus_status(self) -> str:
+        return self.task.focus_status
+
+    @_focus_status.setter
+    def _focus_status(self, value: str) -> None:
+        self.task.focus_status = value
+
+    @property
+    def _focus_remaining_seconds(self) -> float:
+        return self.task.focus_remaining_seconds
+
+    @_focus_remaining_seconds.setter
+    def _focus_remaining_seconds(self, value: float) -> None:
+        self.task.focus_remaining_seconds = value
+
+    @property
+    def _focus_deadline(self) -> float | None:
+        return self.task.focus_deadline
+
+    @_focus_deadline.setter
+    def _focus_deadline(self, value: float | None) -> None:
+        self.task.focus_deadline = value
+
+    @property
+    def _timer_duration_minutes(self) -> int:
+        return self.task.timer_minutes
+
+    @_timer_duration_minutes.setter
+    def _timer_duration_minutes(self, value: int) -> None:
+        self.task.timer_minutes = value
+
+    @property
+    def _timer_remaining_seconds(self) -> float:
+        return self.task.timer_remaining_seconds
+
+    @_timer_remaining_seconds.setter
+    def _timer_remaining_seconds(self, value: float) -> None:
+        self.task.timer_remaining_seconds = value
+
+    @property
+    def _timer_deadline(self) -> float | None:
+        return self.task.timer_deadline
+
+    @_timer_deadline.setter
+    def _timer_deadline(self, value: float | None) -> None:
+        self.task.timer_deadline = value
+
     def _restore_saved_content(self, saved_state: dict[str, object] | None) -> None:
+        del saved_state
+        self.refresh_from_task()
         self.timer_minutes.trace_add("write", self._on_timer_duration_changed)
-        if saved_state is None:
+
+    def refresh_from_task(self) -> None:
+        self._syncing_task = True
+        try:
+            if self.note_text.get("1.0", "end-1c") != self.task.note:
+                self.note_text.delete("1.0", "end")
+                self.note_text.insert("1.0", self.task.note)
+                self.note_text.edit_modified(False)
+            expected_todos = tuple(
+                f"{'☑' if done else '☐'}  {title}"
+                for title, done in self.todo_items
+            )
+            if self.todo_list.get(0, "end") != expected_todos:
+                selected = self._selected_todo_index()
+                if self._editing_todo_index is not None:
+                    self._cancel_todo_edit()
+                self._render_todos(selected)
+            if self.timer_minutes.get() != self.task.timer_minutes:
+                self.timer_minutes.set(self.task.timer_minutes)
+            self._update_focus_display()
+            self._update_timer_display()
+            if hasattr(self, "lock_button"):
+                self._apply_control_colors()
+        finally:
+            self._syncing_task = False
+
+    def bind_task(self, task: TaskState) -> None:
+        if task is self.task:
             return
-        self.note_text.insert("1.0", saved_state["note"])
-        self.todo_items = [
-            (todo["text"], todo["done"])
-            for todo in saved_state["todos"]
-        ]
-        self._render_todos()
-        self.timer_minutes.set(saved_state["timer_minutes"])
-        self._timer_remaining_seconds = self._timer_duration_minutes * 60
-        self._update_timer_display()
+        if self._editing_todo_index is not None:
+            self._cancel_todo_edit()
+        self.task = task
+        self.refresh_from_task()
+        self._notify_state_changed()
 
     def _place_saved_geometry(self, geometry: object) -> tuple[int, int, int, int]:
         width, height, x, y = geometry
@@ -1465,6 +1742,7 @@ class OverlayApp:
             geometry = _native_window_geometry(self.root)
         return {
             "id": self.instance_number,
+            "task_id": self.task_id,
             "active": True,
             "mode": self.mode,
             "geometry": list(geometry),
@@ -1472,12 +1750,6 @@ class OverlayApp:
             "locked": self.locked,
             "ball_geometry": list(self._ball_geometry) if self.collapsed else None,
             "dock_edge": self._dock_edge if self.collapsed else None,
-            "note": self.note_text.get("1.0", "end-1c"),
-            "todos": [
-                {"text": title, "done": done}
-                for title, done in self.todo_items
-            ],
-            "timer_minutes": self._timer_duration_minutes,
         }
 
     def _notify_state_changed(self) -> None:
@@ -1585,6 +1857,12 @@ class OverlayApp:
                 label=mode,
                 command=lambda selected=mode: self.set_mode(selected),
             )
+        self.mode_menu.add_separator()
+        self.mode_menu.add_command(
+            label="绑定任务编号…",
+            command=lambda: self.root.after_idle(self._request_task_binding),
+            state="normal" if self.on_bind_task is not None else "disabled",
+        )
 
         for widget in (self.title_bar, grip, self.title_label, lock_gap):
             widget.bind("<ButtonPress-1>", self._begin_drag)
@@ -1605,7 +1883,7 @@ class OverlayApp:
 
         self.status_label = tk.Label(
             panel,
-            text="●  便签",
+            text=f"●  便签 · 任务 #{self.task_id}",
             bg=BG_PANEL,
             fg=ACCENT,
             font=("Microsoft YaHei UI", 10, "bold"),
@@ -1786,6 +2064,7 @@ class OverlayApp:
             ("todo_toggle_button", "完成 / 撤销", self._toggle_todo),
             ("todo_edit_button", "编辑选中", self._edit_todo),
             ("todo_delete_button", "删除选中", self._delete_todo),
+            ("todo_focus_button", "开始专注", self._start_focus_for_selected),
         ):
             button = tk.Button(
                 self.todo_actions,
@@ -1804,6 +2083,72 @@ class OverlayApp:
             self._register_mode_style(button, bg=BG_BODY, fg=TEXT_MUTED)
         self.todo_list.pack(fill="both", expand=True)
 
+        self.timer_minutes = tk.IntVar(master=self.root, value=25)
+        focus_view = self.mode_views["任务胶囊"]
+        self.focus_header = tk.Frame(focus_view, bg=BG_PANEL)
+        self.focus_header.pack(fill="x")
+        self._register_mode_style(self.focus_header, bg=BG_PANEL)
+        self.focus_task_label = tk.Label(
+            self.focus_header,
+            text="从待办中选择任务",
+            bg=BG_PANEL,
+            fg=TEXT,
+            anchor="w",
+            font=("Microsoft YaHei UI", 10, "bold"),
+        )
+        self.focus_task_label.pack(side="left", fill="x", expand=True)
+        self._register_mode_style(self.focus_task_label, bg=BG_PANEL, fg=TEXT)
+        self.focus_minutes_input = tk.Spinbox(
+            self.focus_header,
+            from_=1,
+            to=180,
+            textvariable=self.timer_minutes,
+            width=4,
+            justify="center",
+            bg=BG_BODY,
+            fg=TEXT,
+            buttonbackground=BG_TITLE,
+            insertbackground=TEXT,
+            relief="flat",
+            font=("Segoe UI", 9),
+        )
+        # The shared duration variable is created before the focus view is built.
+        self.focus_minutes_input.pack(side="right")
+        self._register_mode_style(self.focus_minutes_input, bg=BG_BODY, fg=TEXT)
+        self.focus_time_label = tk.Label(
+            focus_view,
+            text="25:00",
+            bg=BG_PANEL,
+            fg=TEXT,
+            font=("Segoe UI", 28, "bold"),
+        )
+        self._register_mode_style(self.focus_time_label, bg=BG_PANEL, fg=TEXT)
+        self.focus_actions = tk.Frame(focus_view, bg=BG_PANEL)
+        self.focus_actions.pack(side="bottom", fill="x")
+        self._register_mode_style(self.focus_actions, bg=BG_PANEL)
+        for name, label, action in (
+            ("focus_start_button", "暂停", self._toggle_focus),
+            ("focus_reset_button", "重来", self._reset_focus),
+            ("focus_complete_button", "完成任务", self._complete_focus),
+            ("focus_back_button", "返回待办", lambda: self.set_mode("待办")),
+        ):
+            button = tk.Button(
+                self.focus_actions,
+                text=label,
+                command=action,
+                bg=BG_BODY,
+                fg=TEXT_MUTED,
+                relief="flat",
+                bd=0,
+                padx=6,
+                font=("Microsoft YaHei UI", 8),
+                cursor="hand2",
+            )
+            setattr(self, name, button)
+            button.pack(side="left", padx=(0, 5))
+            self._register_mode_style(button, bg=BG_BODY, fg=TEXT_MUTED)
+        self.focus_time_label.pack(expand=True)
+
         timer_view = self.mode_views["倒计时"]
         self.timer_label = tk.Label(
             timer_view,
@@ -1817,7 +2162,6 @@ class OverlayApp:
         self.timer_actions = tk.Frame(timer_view, bg=BG_PANEL)
         self.timer_actions.pack(pady=(0, 4))
         self._register_mode_style(self.timer_actions, bg=BG_PANEL)
-        self.timer_minutes = tk.IntVar(master=self.root, value=25)
         self.timer_minutes_input = tk.Spinbox(
             self.timer_actions,
             from_=1,
@@ -1908,6 +2252,10 @@ class OverlayApp:
     def _show_mode_menu(self) -> None:
         if self.locked or self._background_hidden:
             return
+        self.mode_menu.entryconfigure(
+            len(WINDOW_MODES) + 1,
+            label=f"绑定任务编号…（当前 #{self.task_id}）",
+        )
         try:
             self.mode_menu.tk_popup(
                 self.mode_button.winfo_rootx(),
@@ -1915,6 +2263,24 @@ class OverlayApp:
             )
         finally:
             self.mode_menu.grab_release()
+
+    def _request_task_binding(self) -> None:
+        if self._closed or self.on_bind_task is None:
+            return
+        task_ids = self.on_list_tasks() if self.on_list_tasks is not None else []
+        shown_ids = ", ".join(f"#{task_id}" for task_id in task_ids[:20])
+        if len(task_ids) > 20:
+            shown_ids += " …"
+        task_id = simpledialog.askinteger(
+            "绑定任务",
+            "输入任务编号；已有任务会共享内容，不存在的编号会新建任务。"
+            + (f"\n已有任务：{shown_ids}" if shown_ids else ""),
+            parent=self.root,
+            initialvalue=self.task_id,
+            minvalue=1,
+        )
+        if task_id is not None:
+            self.on_bind_task(self, task_id)
 
     def set_mode(self, mode: str) -> None:
         if mode not in self.mode_views:
@@ -1935,6 +2301,9 @@ class OverlayApp:
         if not self.note_text.edit_modified():
             return
         self.note_text.edit_modified(False)
+        if self._syncing_task:
+            return
+        self.task.note = self.note_text.get("1.0", "end-1c")
         self._refresh_outlined_content()
         self._notify_state_changed()
 
@@ -1993,6 +2362,12 @@ class OverlayApp:
                 f"{'☑' if done else '☐'}  {title}"
                 for title, done in self.todo_items
             ) or "暂无待办"
+        elif self.mode == "任务胶囊":
+            index = self._focus_task_index
+            title = self.todo_items[index][0] if index is not None else "未选择任务"
+            remaining = max(0, math.ceil(self._focus_remaining_seconds))
+            minutes, seconds = divmod(remaining, 60)
+            content = (title, f"{minutes:02d}:{seconds:02d}")
         elif self.mode == "倒计时":
             content = str(self.timer_label.cget("text"))
         else:
@@ -2032,6 +2407,22 @@ class OverlayApp:
                 anchor="nw" if self.todo_items else "center",
                 width=canvas_width - 24 if self.todo_items else 0,
             )
+        elif self.mode == "任务胶囊":
+            title, remaining = content
+            self._draw_outlined_text(
+                title,
+                canvas_width // 2,
+                canvas_height // 3,
+                font=("Microsoft YaHei UI", 12, "bold"),
+                width=canvas_width - 24,
+            )
+            self._draw_outlined_text(
+                remaining,
+                canvas_width // 2,
+                canvas_height * 2 // 3,
+                font=("Segoe UI", 28, "bold"),
+                large=True,
+            )
         elif self.mode == "倒计时":
             self._draw_outlined_text(
                 content,
@@ -2060,6 +2451,9 @@ class OverlayApp:
         if visible:
             self.note_text.pack_forget()
             self.todo_list.pack_forget()
+            self.focus_header.pack_forget()
+            self.focus_time_label.pack_forget()
+            self.focus_actions.pack_forget()
             self.timer_label.pack_forget()
             self.clock_time_label.pack_forget()
             self.clock_date_label.pack_forget()
@@ -2075,6 +2469,9 @@ class OverlayApp:
             self.outlined_canvas.place_forget()
             self.note_text.pack(fill="both", expand=True)
             self.todo_list.pack(fill="both", expand=True)
+            self.focus_header.pack(fill="x")
+            self.focus_actions.pack(side="bottom", fill="x")
+            self.focus_time_label.pack(expand=True)
             self.timer_label.pack(expand=True)
             self.clock_time_label.pack(expand=True)
             self.clock_date_label.pack(pady=(0, 8))
@@ -2090,10 +2487,29 @@ class OverlayApp:
             self.todo_items[editing] = (title, done)
             self._cancel_todo_edit()
             self._render_todos(editing)
+            self._update_focus_display()
         else:
-            self.todo_items.append((title, False))
             self.todo_input.delete(0, "end")
-            self._render_todos(len(self.todo_items) - 1)
+            self.add_todo_text(title)
+            return
+        self._notify_state_changed()
+
+    def add_todo_text(self, title: str) -> None:
+        title = " ".join(title.split())
+        if not title:
+            return
+        self.todo_items.append((title, False))
+        self._render_todos(len(self.todo_items) - 1)
+        self._notify_state_changed()
+
+    def append_note_text(self, value: str) -> None:
+        value = value.strip()
+        if not value:
+            return
+        existing = self.note_text.get("1.0", "end-1c")
+        self.note_text.insert("end", ("\n\n" if existing.strip() else "") + value)
+        self.task.note = self.note_text.get("1.0", "end-1c")
+        self._refresh_outlined_content()
         self._notify_state_changed()
 
     def _edit_todo(self, _event: tk.Event | None = None) -> None:
@@ -2133,6 +2549,7 @@ class OverlayApp:
         title, done = self.todo_items[selected]
         self.todo_items[selected] = (title, not done)
         self._render_todos(selected)
+        self._update_focus_display()
         self._notify_state_changed()
 
     def _delete_todo(self, _event: tk.Event | None = None) -> None:
@@ -2144,10 +2561,100 @@ class OverlayApp:
             self._cancel_todo_edit()
         elif self._editing_todo_index is not None and selected < self._editing_todo_index:
             self._editing_todo_index -= 1
+        if self._focus_task_index == selected:
+            self._focus_task_index = None
+            self._focus_deadline = None
+            self._focus_status = "ready"
+            if self.mode == "任务胶囊":
+                self.set_mode("待办")
+        elif self._focus_task_index is not None and selected < self._focus_task_index:
+            self._focus_task_index -= 1
         self._render_todos(min(selected, len(self.todo_items) - 1))
+        self._update_focus_display()
         self._notify_state_changed()
 
+    def _start_focus_for_selected(self) -> None:
+        selected = self._selected_todo_index()
+        if selected is None:
+            return
+        self._focus_task_index = selected
+        self._focus_remaining_seconds = self._timer_minutes_value() * 60
+        self._focus_deadline = time.monotonic() + self._focus_remaining_seconds
+        self._focus_status = "running"
+        self._update_focus_display()
+        self._notify_state_changed()
+        if self.on_open_focus is not None:
+            self.on_open_focus(self)
+        else:
+            self.set_mode("任务胶囊")
+
+    def _toggle_focus(self) -> None:
+        if self._focus_task_index is None:
+            return
+        if self._focus_deadline is not None:
+            self._focus_remaining_seconds = max(
+                0, self._focus_deadline - time.monotonic()
+            )
+            self._focus_deadline = None
+            self._focus_status = "paused"
+        else:
+            if self._focus_status in ("ready", "finished"):
+                self._focus_remaining_seconds = self._timer_minutes_value() * 60
+            self._focus_deadline = time.monotonic() + self._focus_remaining_seconds
+            self._focus_status = "running"
+        self._update_focus_display()
+        self._notify_state_changed()
+
+    def _reset_focus(self) -> None:
+        if self._focus_task_index is None:
+            return
+        self._focus_deadline = None
+        self._focus_remaining_seconds = self._timer_minutes_value() * 60
+        self._focus_status = "ready"
+        self._update_focus_display()
+        self._notify_state_changed()
+
+    def _complete_focus(self) -> None:
+        index = self._focus_task_index
+        if index is None:
+            return
+        title, _done = self.todo_items[index]
+        self.todo_items[index] = (title, True)
+        self._focus_deadline = None
+        self._focus_status = "finished"
+        self._render_todos(index)
+        self._update_focus_display()
+        self._notify_state_changed()
+
+    def _update_focus_display(self) -> None:
+        index = self._focus_task_index
+        if index is not None and 0 <= index < len(self.todo_items):
+            title, done = self.todo_items[index]
+            short_title = title[:44] + ("…" if len(title) > 44 else "")
+            self.focus_task_label.configure(text=f"{'☑' if done else '☐'}  {short_title}")
+        else:
+            self.focus_task_label.configure(text="从待办中选择任务")
+        seconds = max(0, math.ceil(self._focus_remaining_seconds))
+        minutes, seconds = divmod(seconds, 60)
+        self.focus_time_label.configure(
+            text=f"{minutes:02d}:{seconds:02d}",
+            fg=ACCENT if self._focus_status == "finished" else TEXT,
+        )
+        self.focus_start_button.configure(
+            text=("暂停" if self._focus_status == "running" else "继续" if self._focus_status == "paused" else "开始"),
+            state="normal" if index is not None else "disabled",
+        )
+        self.focus_reset_button.configure(
+            state="normal" if index is not None else "disabled"
+        )
+        self.focus_complete_button.configure(
+            state="normal" if index is not None else "disabled"
+        )
+        self._refresh_outlined_content()
+
     def _on_timer_duration_changed(self, *_trace_arguments: str) -> None:
+        if self._syncing_task:
+            return
         try:
             minutes = int(self.timer_minutes.get())
         except (tk.TclError, ValueError):
@@ -2155,6 +2662,9 @@ class OverlayApp:
         if not 1 <= minutes <= 180:
             return
         self._timer_duration_minutes = minutes
+        if self._focus_deadline is None and self._focus_status == "ready":
+            self._focus_remaining_seconds = minutes * 60
+            self._update_focus_display()
         self._notify_state_changed()
 
     def _timer_minutes_value(self) -> int:
@@ -2174,23 +2684,32 @@ class OverlayApp:
                 self._timer_deadline - time.monotonic(),
             )
             self._timer_deadline = None
-            self.timer_start_button.configure(text="继续")
+            self.task.timer_status = "paused"
         else:
-            if self.timer_start_button.cget("text") in ("开始", "重新开始"):
+            if self.task.timer_status in ("ready", "finished"):
                 self._timer_remaining_seconds = self._timer_minutes_value() * 60
             self._timer_deadline = time.monotonic() + self._timer_remaining_seconds
-            self.timer_start_button.configure(text="暂停")
+            self.task.timer_status = "running"
         self._update_timer_display()
+        self._notify_state_changed()
 
     def _reset_timer(self) -> None:
         self._timer_deadline = None
         self._timer_remaining_seconds = self._timer_minutes_value() * 60
-        self.timer_start_button.configure(text="开始")
+        self.task.timer_status = "ready"
         self._update_timer_display()
+        self._notify_state_changed()
 
     def _update_timer_display(self) -> None:
         remaining = max(0, math.ceil(self._timer_remaining_seconds))
         minutes, seconds = divmod(remaining, 60)
+        self.timer_start_button.configure(
+            text={
+                "running": "暂停",
+                "paused": "继续",
+                "finished": "重新开始",
+            }.get(self.task.timer_status, "开始")
+        )
         self.timer_label.configure(
             text=f"{minutes:02d}:{seconds:02d}",
             fg=CLOSE_HOVER if remaining == 0 else TEXT,
@@ -2208,8 +2727,22 @@ class OverlayApp:
             )
             if self._timer_remaining_seconds == 0:
                 self._timer_deadline = None
-                self.timer_start_button.configure(text="重新开始")
+                self.task.timer_status = "finished"
+                self._notify_state_changed()
             self._update_timer_display()
+        if self._focus_deadline is not None:
+            self._focus_remaining_seconds = max(
+                0, self._focus_deadline - time.monotonic()
+            )
+            if self._focus_remaining_seconds == 0:
+                self._focus_deadline = None
+                self._focus_status = "finished"
+                if self.visible:
+                    self.root.bell()
+                if self.on_focus_complete is not None:
+                    self.on_focus_complete(self)
+                self._notify_state_changed()
+            self._update_focus_display()
         now = time.localtime()
         self.clock_time_label.configure(text=time.strftime("%H:%M:%S", now))
         weekday = "一二三四五六日"[now.tm_wday]
@@ -2870,7 +3403,7 @@ class OverlayApp:
         )
         if self.locked:
             self.status_label.configure(
-                text=f"●  {self.mode} · 已锁定",
+                text=f"●  {self.mode} · 任务 #{self.task_id} · 已锁定",
                 bg=BG_PANEL,
                 fg=LOCKED_ACCENT,
             )
@@ -2891,7 +3424,7 @@ class OverlayApp:
                 activeforeground="#102219",
             )
             self.status_label.configure(
-                text=f"●  {self.mode}",
+                text=f"●  {self.mode} · 任务 #{self.task_id}",
                 bg=BG_PANEL,
                 fg=ACCENT,
             )
@@ -2978,6 +3511,8 @@ class DesktopManager:
         self._update_message = f"当前版本 v{APP_VERSION}"
         self.windows: list[OverlayApp] = []
         self.settings_window: tk.Toplevel | None = None
+        self.quick_capture_window: tk.Toplevel | None = None
+        self.quick_capture_text: tk.Text | None = None
 
         self.root = tk.Tk()
         self.root.withdraw()
@@ -2998,6 +3533,31 @@ class DesktopManager:
             state_path if state_path is not None else self.settings_store.path.with_name("windows.json")
         )
         self._window_records = self.window_store.load()
+        stored_tasks = self.window_store.load_tasks()
+        if stored_tasks is None:
+            self._tasks = {
+                int(record["task_id"]): TaskState.from_record(
+                    int(record["task_id"]), record
+                )
+                for record in self._window_records
+            }
+            for record in self._window_records:
+                for key in (
+                    "note", "todos", "focus_task_index", "focus_status",
+                    "focus_remaining_seconds", "timer_minutes",
+                ):
+                    record.pop(key, None)
+        else:
+            self._tasks = {
+                int(record["id"]): TaskState.from_record(int(record["id"]), record)
+                for record in stored_tasks
+            }
+        for record in self._window_records:
+            task_id = int(record["task_id"])
+            self._tasks.setdefault(task_id, TaskState(task_id))
+        self._task_snapshots = {
+            task_id: task.snapshot() for task_id, task in self._tasks.items()
+        }
         self._next_instance_number = max(
             (int(record["id"]) for record in self._window_records),
             default=0,
@@ -3041,9 +3601,13 @@ class DesktopManager:
             on_add=self.add_window,
             on_settings=self.open_settings,
             on_update=self._tray_check_updates,
+            on_capture=self.open_quick_capture,
             on_exit=self.exit_app,
             show_icon=tray_enabled,
         )
+
+        if stored_tasks is None and self._window_records:
+            self._schedule_window_states_save()
 
         if create_initial_window:
             active_records = [
@@ -3061,9 +3625,11 @@ class DesktopManager:
     def add_window(
         self,
         initial_position: tuple[int, int] | None = None,
+        *,
+        task_id: int | None = None,
     ) -> OverlayApp:
         saved_state = None
-        if initial_position is None:
+        if initial_position is None and task_id is None:
             saved_state = next(
                 (record for record in reversed(self._window_records) if not record["active"]),
                 None,
@@ -3080,18 +3646,29 @@ class DesktopManager:
                 previous_y = previous.root.winfo_y()
             initial_position = previous_x + 36, previous_y + 36
 
-        return self._open_window(None, initial_position=initial_position)
+        return self._open_window(
+            None, initial_position=initial_position, task_id=task_id
+        )
 
     def _open_window(
         self,
         saved_state: dict[str, object] | None,
         *,
         initial_position: tuple[int, int] | None = None,
+        task_id: int | None = None,
     ) -> OverlayApp:
         instance_number = (
             int(saved_state["id"])
             if saved_state is not None
             else self._next_instance_number
+        )
+        resolved_task_id = (
+            int(saved_state["task_id"])
+            if saved_state is not None
+            else task_id if task_id is not None else instance_number
+        )
+        task = self._tasks.setdefault(
+            resolved_task_id, TaskState(resolved_task_id)
         )
 
         window = OverlayApp(
@@ -3105,7 +3682,12 @@ class DesktopManager:
             no_background=self.no_background,
             instance_number=instance_number,
             saved_state=saved_state,
+            task=task,
             on_state_change=self._on_window_state_changed,
+            on_focus_complete=self._on_focus_complete,
+            on_open_focus=self._open_focus_window,
+            on_bind_task=self.bind_window_to_task,
+            on_list_tasks=lambda: sorted(self._tasks),
         )
         if saved_state is None:
             self._next_instance_number += 1
@@ -3115,19 +3697,70 @@ class DesktopManager:
         self._update_instance_count()
         return window
 
+    def bind_window_to_task(self, window: OverlayApp, task_id: int) -> None:
+        if type(task_id) is not int or task_id < 1:
+            raise ValueError("任务编号必须是正整数")
+        if window not in self.windows:
+            return
+        task = self._tasks.setdefault(task_id, TaskState(task_id))
+        window.bind_task(task)
+
+    def _open_focus_window(self, source: OverlayApp) -> None:
+        existing = next(
+            (
+                window for window in self.windows
+                if window is not source
+                and window.task is source.task
+                and window.mode == "任务胶囊"
+            ),
+            None,
+        )
+        if existing is not None:
+            if existing.collapsed and not existing.animating:
+                existing._restore_from_ball()
+            elif not existing.locked and self.visible:
+                existing.root.lift()
+            return
+        if source.collapsed and source._ball_geometry is not None:
+            x, y = source._ball_geometry[2:]
+        else:
+            x, y = source.root.winfo_x(), source.root.winfo_y()
+        capsule = self.add_window(
+            initial_position=(x + 36, y + 36),
+            task_id=source.task_id,
+        )
+        capsule.set_mode("任务胶囊")
+
     def _on_window_state_changed(self, window: OverlayApp) -> None:
         if self._exiting:
             return
         snapshot = window.state_snapshot()
+        task_snapshot = window.task.snapshot()
+        previous_task = self._task_snapshots.get(window.task_id)
+        task_changed = previous_task != task_snapshot
+        if task_changed:
+            self._task_snapshots[window.task_id] = task_snapshot
+            visual_changed = previous_task is None or any(
+                previous_task.get(key) != task_snapshot.get(key)
+                for key in (
+                    "note", "todos", "focus_task_index", "focus_status",
+                    "timer_minutes", "timer_status",
+                )
+            )
+            if visual_changed:
+                for peer in self.windows:
+                    if peer is not window and peer.task is window.task:
+                        peer.refresh_from_task()
+        window_changed = True
         for index, record in enumerate(self._window_records):
             if record["id"] == window.instance_number:
-                if record == snapshot:
-                    return
+                window_changed = record != snapshot
                 self._window_records[index] = snapshot
                 break
         else:
             self._window_records.append(snapshot)
-        self._schedule_window_states_save()
+        if task_changed or window_changed:
+            self._schedule_window_states_save()
 
     def _schedule_window_states_save(self) -> None:
         self._window_state_dirty = True
@@ -3152,7 +3785,10 @@ class DesktopManager:
         if not self._window_state_dirty:
             return
         try:
-            self.window_store.save(self._window_records)
+            self.window_store.save(
+                self._window_records,
+                [task.snapshot() for _, task in sorted(self._tasks.items())],
+            )
         except OSError:
             self._window_state_dirty = True
             self._window_save_error = True
@@ -3166,6 +3802,21 @@ class DesktopManager:
         if window in self.windows:
             self.windows.remove(window)
         if not self._exiting:
+            if not any(peer.task is window.task for peer in self.windows):
+                task = window.task
+                if task.focus_deadline is not None:
+                    task.focus_remaining_seconds = max(
+                        0, task.focus_deadline - time.monotonic()
+                    )
+                    task.focus_deadline = None
+                    task.focus_status = "paused"
+                if task.timer_deadline is not None:
+                    task.timer_remaining_seconds = max(
+                        0, task.timer_deadline - time.monotonic()
+                    )
+                    task.timer_deadline = None
+                    task.timer_status = "paused"
+                self._task_snapshots[task.id] = task.snapshot()
             for index, record in enumerate(self._window_records):
                 if record["id"] == window.instance_number:
                     self._window_records.pop(index)
@@ -3175,6 +3826,179 @@ class DesktopManager:
             self._schedule_window_states_save()
             self._save_window_states_now()
         self._update_instance_count()
+
+    def _on_focus_complete(self, window: OverlayApp) -> None:
+        index = window._focus_task_index
+        if index is None or not 0 <= index < len(window.todo_items):
+            return
+        self.tray.notify(
+            "专注时间到了",
+            f"{window.todo_items[index][0][:100]} —— 可以标记完成了",
+        )
+
+    def open_quick_capture(self, *, prefill_clipboard: bool = True) -> None:
+        if self._exiting:
+            return
+        if self.quick_capture_window is not None and self.quick_capture_window.winfo_exists():
+            if self.visible:
+                self.quick_capture_window.deiconify()
+                self.quick_capture_window.lift()
+                self.quick_capture_text.focus_force()
+            return
+
+        window = tk.Toplevel(self.root)
+        self.quick_capture_window = window
+        if not self.visible:
+            window.withdraw()
+        window.title("DesktopTools 快速收集")
+        window.configure(bg=BG_BODY)
+        window.resizable(False, False)
+        window.attributes("-topmost", True)
+        try:
+            window.attributes("-toolwindow", True)
+        except tk.TclError:
+            pass
+        window.protocol("WM_DELETE_WINDOW", self.close_quick_capture)
+        window.bind("<Escape>", lambda _event: self.close_quick_capture())
+
+        tk.Label(
+            window,
+            text="快速收集",
+            bg=BG_BODY,
+            fg=TEXT,
+            font=("Microsoft YaHei UI", 12, "bold"),
+            anchor="w",
+        ).pack(fill="x", padx=18, pady=(16, 4))
+        tk.Label(
+            window,
+            text=(
+                "Ctrl+Alt+D 随时唤出；复制的文字会自动填入"
+                if self.tray.hotkey_registered
+                else "可从托盘菜单唤出；复制的文字会自动填入"
+            ),
+            bg=BG_BODY,
+            fg=TEXT_MUTED,
+            font=("Microsoft YaHei UI", 9),
+            anchor="w",
+        ).pack(fill="x", padx=18, pady=(0, 8))
+        self.quick_capture_text = tk.Text(
+            window,
+            height=4,
+            wrap="word",
+            bg=BG_PANEL,
+            fg=TEXT,
+            insertbackground=ACCENT,
+            relief="flat",
+            bd=0,
+            font=("Microsoft YaHei UI", 10),
+            padx=8,
+            pady=6,
+        )
+        self.quick_capture_text.pack(fill="x", padx=18)
+        if prefill_clipboard:
+            try:
+                copied = self.root.clipboard_get()
+            except tk.TclError:
+                copied = ""
+            if isinstance(copied, str) and len(copied) <= 20_000:
+                self.quick_capture_text.insert("1.0", copied)
+
+        self.quick_capture_status = tk.Label(
+            window,
+            text="存入最近的同类窗口；没有时会新建。",
+            bg=BG_BODY,
+            fg=TEXT_MUTED,
+            font=("Microsoft YaHei UI", 8),
+            anchor="w",
+        )
+        self.quick_capture_status.pack(fill="x", padx=18, pady=(7, 6))
+        actions = tk.Frame(window, bg=BG_BODY)
+        actions.pack(fill="x", padx=18, pady=(0, 16))
+        for label, destination in (
+            ("加入待办", "待办"),
+            ("追加到便签", "便签"),
+        ):
+            tk.Button(
+                actions,
+                text=label,
+                command=lambda kind=destination: self._save_quick_capture(kind),
+                bg=ACCENT if destination == "待办" else BG_PANEL,
+                fg="#102219" if destination == "待办" else TEXT,
+                relief="flat",
+                bd=0,
+                padx=12,
+                pady=5,
+                font=("Microsoft YaHei UI", 9),
+                cursor="hand2",
+            ).pack(side="left", padx=(0, 8))
+        tk.Button(
+            actions,
+            text="取消",
+            command=self.close_quick_capture,
+            bg=BG_PANEL,
+            fg=TEXT_MUTED,
+            relief="flat",
+            bd=0,
+            padx=12,
+            pady=5,
+            font=("Microsoft YaHei UI", 9),
+            cursor="hand2",
+        ).pack(side="right")
+
+        width, height = 420, 236
+        cursor = Point()
+        user32.GetCursorPos(ctypes.byref(cursor))
+        _monitor, (left, top, right, bottom) = _monitor_areas_at(cursor.x, cursor.y)
+        x = _clamp(cursor.x + 14, left, right - width)
+        y = _clamp(cursor.y + 14, top, bottom - height)
+        _set_absolute_geometry(window, width=width, height=height, x=x, y=y)
+        if self.visible:
+            window.deiconify()
+            window.lift()
+            self.quick_capture_text.focus_force()
+
+    def _save_quick_capture(self, destination: str) -> None:
+        if self.quick_capture_text is None:
+            return
+        content = self.quick_capture_text.get("1.0", "end-1c").strip()
+        if not content or len(content) > 20_000:
+            self.quick_capture_status.configure(
+                text="请输入内容（最多 20,000 字符）。",
+                fg=CLOSE_HOVER,
+            )
+            return
+        mode = "待办" if destination == "待办" else "便签"
+        target = next(
+            (
+                window
+                for window in reversed(self.windows)
+                if window.mode == mode
+                or (mode == "待办" and window.mode == "任务胶囊")
+            ),
+            None,
+        )
+        if target is None:
+            cursor = Point()
+            user32.GetCursorPos(ctypes.byref(cursor))
+            target = self.add_window(initial_position=(cursor.x, cursor.y))
+            target.set_mode(mode)
+        if mode == "待办":
+            target.add_todo_text(content)
+        else:
+            target.append_note_text(content)
+        self._save_window_states_now()
+        self.tray.notify("快速收集已保存", f"已存入自由窗口 #{target.instance_number} 的{mode}")
+        self.close_quick_capture()
+
+    def close_quick_capture(self) -> None:
+        if self.quick_capture_window is not None:
+            try:
+                if self.quick_capture_window.winfo_exists():
+                    self.quick_capture_window.destroy()
+            except tk.TclError:
+                pass
+        self.quick_capture_window = None
+        self.quick_capture_text = None
 
     def _on_no_background_changed(self, *_trace_arguments: str) -> None:
         self._refresh_backgrounds()
@@ -3690,6 +4514,7 @@ class DesktopManager:
             self._on_window_state_changed(window)
         self._save_window_states_now()
         self._exiting = True
+        self.close_quick_capture()
         self.close_settings()
         if self._update_poll_after_id is not None:
             try:
@@ -3806,6 +4631,33 @@ def _self_test() -> None:
     app.todo_input.insert(0, "检查切换")
     app._add_todo()
     assert app.todo_items == [("检查切换", True)]
+    app.timer_minutes.set(1)
+    app.todo_focus_button.invoke()
+    assert app.mode == "任务胶囊"
+    assert app._focus_task_index == 0
+    assert app._focus_status == "running"
+    assert app.focus_task_label.cget("text") == "☑  检查切换"
+    app._toggle_focus()
+    assert app._focus_status == "paused"
+    assert 0 < app.task.snapshot()["focus_remaining_seconds"] <= 60
+    app._toggle_focus()
+    assert app._focus_status == "running"
+    app._focus_deadline = time.monotonic() - 1
+    focus_test_deadline = time.monotonic() + 1
+    while app._focus_status != "finished" and time.monotonic() < focus_test_deadline:
+        app.root.update()
+        time.sleep(0.01)
+    assert app._focus_status == "finished"
+    app._complete_focus()
+    assert app.todo_items == [("检查切换", True)]
+    app._reset_focus()
+    assert app.focus_time_label.cget("text") == "01:00"
+    app.set_locked(True)
+    app.root.update()
+    assert app._background_hidden
+    assert "检查切换" in outlined_text(app)
+    assert "01:00" in outlined_text(app)
+    app.set_locked(False)
     app.set_mode("倒计时")
     app.timer_minutes.set(2)
     app._reset_timer()
@@ -4032,7 +4884,7 @@ def _self_test() -> None:
     )
     fake_package = b"MZ" + b"desktop-tools-update-test" * 128
     fake_manifest = {
-        "version": "2.0.0",
+        "version": "3.0.0",
         "sha256": hashlib.sha256(fake_package).hexdigest(),
         "size": len(fake_package),
     }
@@ -4103,6 +4955,7 @@ def _self_test() -> None:
     assert test_menu, "test popup menu was not created"
     try:
         user32.AppendMenuW(test_menu, MF_STRING, TRAY_COMMAND_ADD, "添加自由窗口")
+        user32.AppendMenuW(test_menu, MF_STRING, TRAY_COMMAND_CAPTURE, "快速收集")
         user32.AppendMenuW(test_menu, MF_STRING, TRAY_COMMAND_SETTINGS, "设置")
         user32.AppendMenuW(test_menu, MF_STRING, TRAY_COMMAND_UPDATE, "检查更新")
         user32.AppendMenuW(test_menu, MF_STRING, TRAY_COMMAND_EXIT, "退出")
@@ -4179,18 +5032,26 @@ def _self_test() -> None:
         manager.root.update()
         time.sleep(0.01)
     assert not manager._window_state_dirty, "window edits were not saved automatically"
-    saved_windows = json.loads(state_path.read_text(encoding="utf-8"))["windows"]
+    saved_state = json.loads(state_path.read_text(encoding="utf-8"))
+    saved_windows = saved_state["windows"]
+    saved_tasks = {task["id"]: task for task in saved_state["tasks"]}
+    assert saved_state["version"] == 2
     assert len(saved_windows) == 2
     assert saved_windows[0]["mode"] == "待办"
     assert saved_windows[0]["geometry"] == [470, 310, test_x, test_y], saved_windows[0]["geometry"]
-    assert saved_windows[0]["note"] == "第一扇便签"
-    assert saved_windows[0]["todos"] == [
+    assert saved_windows[0]["task_id"] == first_window.instance_number
+    assert saved_windows[1]["task_id"] == second_window.instance_number
+    assert saved_tasks[first_window.task_id]["note"] == "第一扇便签"
+    assert saved_tasks[first_window.task_id]["todos"] == [
         {"text": "改好的待办", "done": True}
     ]
-    assert saved_windows[0]["timer_minutes"] == 7
-    assert saved_windows[1]["note"] == "第二扇便签"
+    assert saved_tasks[first_window.task_id]["timer_minutes"] == 7
+    assert saved_tasks[second_window.task_id]["note"] == "第二扇便签"
     assert not any(record["locked"] for record in saved_windows)
     legacy_state = dict(saved_windows[0])
+    legacy_state.update(saved_tasks[first_window.task_id])
+    legacy_state["id"] = first_window.instance_number
+    legacy_state.pop("task_id")
     del legacy_state["locked"]
     legacy_path = test_settings_path.with_name("legacy-windows.json")
     legacy_path.write_text(
@@ -4198,6 +5059,23 @@ def _self_test() -> None:
         encoding="utf-8",
     )
     assert WindowStateStore(legacy_path).load()[0]["locked"] is False
+    assert WindowStateStore(legacy_path).load_tasks() is None
+    migrated_manager = DesktopManager(
+        tray_enabled=False,
+        visible=False,
+        settings_path=test_settings_path.with_name("legacy-settings.json"),
+        state_path=legacy_path,
+        auto_start_store=MemoryAutoStartStore(),
+        update_client=current_client,
+    )
+    assert migrated_manager.windows[0].task_id == first_window.instance_number
+    assert migrated_manager.windows[0].todo_items == [("改好的待办", True)]
+    migrated_manager._save_window_states_now()
+    migrated_state = json.loads(legacy_path.read_text(encoding="utf-8"))
+    assert migrated_state["version"] == 2
+    assert migrated_state["tasks"][0]["note"] == "第一扇便签"
+    assert "todos" not in migrated_state["windows"][0]
+    migrated_manager.exit_app()
     assert second_window.mode == "便签"
     assert not second_window.todo_items
     manager.tray.dispatch_command_for_test(TRAY_COMMAND_SETTINGS)
@@ -4403,12 +5281,177 @@ def _self_test() -> None:
     assert reopened.unlock_canvas.winfo_ismapped()
     assert closed_reopen_manager.auto_start.get() is True
     closed_reopen_manager.exit_app()
+
+    capture_settings_path = (
+        Path(temporary_settings_directory.name) / "Capture" / "settings.json"
+    )
+    capture_manager = DesktopManager(
+        tray_enabled=False,
+        visible=True,
+        create_initial_window=False,
+        settings_path=capture_settings_path,
+        auto_start_store=MemoryAutoStartStore(),
+        update_client=current_client,
+    )
+    assert not capture_manager.windows
+    capture_manager.open_quick_capture(prefill_clipboard=False)
+    assert capture_manager.quick_capture_text is not None
+    capture_manager.quick_capture_text.insert("1.0", "快速收集的待办")
+    capture_manager._save_quick_capture("待办")
+    assert len(capture_manager.windows) == 1
+    todo_window = capture_manager.windows[0]
+    assert todo_window.mode == "待办"
+    assert todo_window.task_id == todo_window.instance_number
+    assert todo_window.todo_items == [("快速收集的待办", False)]
+    todo_window.timer_minutes.set(3)
+    todo_window._start_focus_for_selected()
+    assert len(capture_manager.windows) == 2
+    focus_window = capture_manager.windows[-1]
+    assert todo_window.mode == "待办"
+    assert focus_window.mode == "任务胶囊"
+    assert focus_window.instance_number != todo_window.instance_number
+    assert focus_window.task_id == todo_window.task_id
+    assert focus_window.task is todo_window.task
+    _set_absolute_geometry(
+        focus_window.root,
+        width=MIN_WIDTH,
+        height=MIN_HEIGHT,
+        x=focus_window.root.winfo_x(),
+        y=focus_window.root.winfo_y(),
+    )
+    capture_manager.root.update()
+    assert focus_window.focus_header.winfo_ismapped()
+    assert focus_window.focus_actions.winfo_ismapped()
+    assert (
+        focus_window.focus_actions.winfo_x()
+        + focus_window.focus_actions.winfo_width()
+        <= focus_window.mode_views["任务胶囊"].winfo_width()
+    )
+    focus_window._toggle_focus()
+    assert focus_window._focus_status == "paused"
+    capture_manager.open_quick_capture(prefill_clipboard=False)
+    capture_manager.quick_capture_text.insert("1.0", "第二项待办")
+    capture_manager._save_quick_capture("待办")
+    assert len(capture_manager.windows) == 2
+    assert focus_window.todo_items == [
+        ("快速收集的待办", False), ("第二项待办", False)
+    ]
+    assert todo_window.todo_items == focus_window.todo_items
+    capture_manager.open_quick_capture(prefill_clipboard=False)
+    capture_manager.quick_capture_text.insert("1.0", "第一段便签")
+    capture_manager._save_quick_capture("便签")
+    assert len(capture_manager.windows) == 3
+    note_window = capture_manager.windows[-1]
+    assert note_window.mode == "便签"
+    assert note_window.task_id == note_window.instance_number
+    capture_manager.open_quick_capture(prefill_clipboard=False)
+    capture_manager.quick_capture_text.insert("1.0", "第二段便签")
+    capture_manager._save_quick_capture("便签")
+    assert len(capture_manager.windows) == 3
+    assert note_window.note_text.get("1.0", "end-1c") == "第一段便签\n\n第二段便签"
+
+    linked_window = capture_manager.add_window(initial_position=(100, 100))
+    assert linked_window.task_id == linked_window.instance_number
+    assert linked_window.task is not todo_window.task
+    linked_window.append_note_text("原来的独立内容")
+    original_askinteger = simpledialog.askinteger
+    try:
+        simpledialog.askinteger = lambda *_args, **_kwargs: todo_window.task_id
+        linked_window.mode_menu.invoke(len(WINDOW_MODES) + 1)
+        capture_manager.root.update()
+    finally:
+        simpledialog.askinteger = original_askinteger
+    assert linked_window.task is todo_window.task is focus_window.task
+    assert linked_window.instance_number != linked_window.task_id
+    assert linked_window.note_text.get("1.0", "end-1c") == ""
+    linked_window.append_note_text("共享便签")
+    assert todo_window.note_text.get("1.0", "end-1c") == "共享便签"
+    assert focus_window.note_text.get("1.0", "end-1c") == "共享便签"
+    linked_window.note_text.insert("end", "！")
+    capture_manager.root.update()
+    assert todo_window.note_text.get("1.0", "end-1c") == "共享便签！"
+    linked_window.add_todo_text("跨窗口同步事项")
+    assert todo_window.todo_items[-1] == ("跨窗口同步事项", False)
+    assert todo_window.todo_list.get("end") == "☐  跨窗口同步事项"
+    capture_manager.bind_window_to_task(linked_window, linked_window.instance_number)
+    assert linked_window.note_text.get("1.0", "end-1c") == "原来的独立内容"
+    assert not linked_window.todo_items
+    capture_manager.bind_window_to_task(linked_window, todo_window.task_id)
+    linked_window.set_mode("倒计时")
+    linked_window.timer_minutes.set(4)
+    assert todo_window.timer_minutes.get() == 4
+    assert focus_window.timer_minutes.get() == 4
+    linked_window._toggle_timer()
+    assert todo_window.timer_start_button.cget("text") == "暂停"
+    linked_window._toggle_timer()
+    assert todo_window.timer_start_button.cget("text") == "继续"
+    focus_window._toggle_focus()
+    assert focus_window._focus_status == "running"
+    capture_manager._save_window_states_now()
+    capture_manager.exit_app()
+    capture_reopened = DesktopManager(
+        tray_enabled=False,
+        visible=True,
+        settings_path=capture_settings_path,
+        auto_start_store=MemoryAutoStartStore(),
+        update_client=current_client,
+    )
+    assert len(capture_reopened.windows) == 4
+    restored_focus = next(
+        window for window in capture_reopened.windows
+        if window.mode == "任务胶囊"
+    )
+    assert restored_focus._focus_status == "paused"
+    assert 0 < restored_focus._focus_remaining_seconds <= 180
+    assert restored_focus.focus_time_label.cget("text").startswith(("02:", "03:"))
+    assert restored_focus.todo_items == [
+        ("快速收集的待办", False),
+        ("第二项待办", False),
+        ("跨窗口同步事项", False),
+    ]
+    restored_todo = next(
+        window for window in capture_reopened.windows
+        if window.mode == "待办"
+    )
+    assert restored_focus.task is restored_todo.task
+    restored_linked = next(
+        window for window in capture_reopened.windows
+        if window.mode == "倒计时"
+    )
+    assert restored_linked.task is restored_todo.task
+    assert restored_linked.task_id != restored_linked.instance_number
+    assert restored_linked.note_text.get("1.0", "end-1c") == "共享便签！"
+    assert restored_linked.timer_minutes.get() == 4
+    saved_capture = json.loads(
+        capture_settings_path.with_name("windows.json").read_text(encoding="utf-8")
+    )
+    assert any(
+        task["id"] == restored_linked.instance_number
+        and task["note"] == "原来的独立内容"
+        for task in saved_capture["tasks"]
+    )
+    restored_focus._complete_focus()
+    assert restored_todo.todo_items[0] == ("快速收集的待办", True)
+    restored_linked._toggle_focus()
+    assert restored_todo._focus_status == "running"
+    restored_focus.close()
+    restored_todo.close()
+    assert restored_linked._focus_status == "running"
+    restored_linked.close()
+    assert restored_linked.task.focus_status == "paused"
+    assert next(
+        window for window in capture_reopened.windows
+        if window.mode == "便签"
+    ).note_text.get("1.0", "end-1c") == "第一段便签\n\n第二段便签"
+    capture_reopened.exit_app()
     temporary_settings_directory.cleanup()
     print(
         "Self-test passed: tray manager and icons, persistent settings and windows, "
         "per-user auto-start option, "
         "verified GitHub update index and persistent auto-update option, "
-        "four independent window modes, editable and removable todos, "
+        "independent window/task ids, shared task views and legacy migration, "
+        "five window modes with persistent task focus, editable and removable todos, "
+        "quick capture to existing or new windows, "
         "empty-note placeholder, "
         "no-background mode, persistent content-visible click-through lock, "
         "background lifetime, "
