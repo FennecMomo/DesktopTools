@@ -48,8 +48,8 @@ BG_PANEL = "#222730"
 BORDER = "#4B5262"
 TEXT = "#F5F7FA"
 TEXT_MUTED = "#AAB2C0"
-NO_BACKGROUND_TEXT = "#17212D"
-NO_BACKGROUND_MUTED = "#344455"
+OUTLINED_TEXT_FILL = "#FFFFFF"
+OUTLINED_TEXT_STROKE = "#000000"
 ACCENT = "#66D9A6"
 ACCENT_HOVER = "#80E5B7"
 LOCKED_ACCENT = "#F5B85C"
@@ -1185,14 +1185,6 @@ class OverlayApp:
         )
         self.note_text.pack(fill="both", expand=True)
         self._register_mode_style(self.note_text, bg=BG_PANEL)
-        self.empty_note_label = tk.Label(
-            note_view,
-            text="空便签",
-            bg=BG_PANEL,
-            fg=NO_BACKGROUND_MUTED,
-            font=("Microsoft YaHei UI", 12, "bold"),
-        )
-        self._register_mode_style(self.empty_note_label, bg=BG_PANEL)
         self.note_text.bind("<<Modified>>", self._on_note_modified)
 
         todo_view = self.mode_views["待办"]
@@ -1356,6 +1348,18 @@ class OverlayApp:
         self._register_mode_style(self.clock_date_label, bg=BG_PANEL)
         self.mode_views[self.mode].pack(fill="both", expand=True)
 
+        self.outlined_canvas = tk.Canvas(
+            self.mode_container,
+            bg=TRANSPARENT_KEY,
+            bd=0,
+            highlightthickness=0,
+        )
+        self._outline_snapshot: tuple[object, ...] | None = None
+        self.outlined_canvas.bind(
+            "<Configure>",
+            lambda _event: self._refresh_outlined_content(),
+        )
+
     def _show_mode_menu(self) -> None:
         if self.locked or self._background_hidden:
             return
@@ -1379,25 +1383,155 @@ class OverlayApp:
         self._apply_control_colors()
         if self._background_hidden:
             self._apply_background_state()
-        self._refresh_empty_note_label()
+        self._refresh_outlined_content()
 
     def _on_note_modified(self, _event: tk.Event) -> None:
         if not self.note_text.edit_modified():
             return
         self.note_text.edit_modified(False)
-        self._refresh_empty_note_label()
+        self._refresh_outlined_content()
 
-    def _refresh_empty_note_label(self) -> None:
-        show_placeholder = (
-            self._background_hidden
-            and self.mode == "便签"
-            and not self.note_text.get("1.0", "end-1c").strip()
+    def _draw_outlined_text(
+        self,
+        value: str,
+        x: int,
+        y: int,
+        *,
+        font: tuple[str, int] | tuple[str, int, str],
+        anchor: str = "center",
+        width: int = 0,
+        large: bool = False,
+    ) -> None:
+        options = {
+            "text": value,
+            "font": font,
+            "anchor": anchor,
+            "justify": "left" if anchor == "nw" else "center",
+            "width": width,
+        }
+        offsets = [
+            (dx, dy)
+            for dy in (-1, 0, 1)
+            for dx in (-1, 0, 1)
+            if dx or dy
+        ]
+        if large:
+            offsets.extend(((-2, 0), (2, 0), (0, -2), (0, 2)))
+        for dx, dy in offsets:
+            self.outlined_canvas.create_text(
+                x + dx,
+                y + dy,
+                fill=OUTLINED_TEXT_STROKE,
+                tags=("outlined-stroke",),
+                **options,
+            )
+        self.outlined_canvas.create_text(
+            x,
+            y,
+            fill=OUTLINED_TEXT_FILL,
+            tags=("outlined-fill",),
+            **options,
         )
-        if show_placeholder:
-            self.empty_note_label.place(relx=0.5, rely=0.5, anchor="center")
-            self.empty_note_label.lift()
+
+    def _refresh_outlined_content(self) -> None:
+        if not self._background_hidden:
+            return
+        canvas_width = max(240, self.outlined_canvas.winfo_width())
+        canvas_height = max(100, self.outlined_canvas.winfo_height())
+        if self.mode == "便签":
+            note = self.note_text.get("1.0", "end-1c")
+            content = note if note.strip() else "空便签"
+        elif self.mode == "待办":
+            content = "\n".join(
+                f"{'☑' if done else '☐'}  {title}"
+                for title, done in self.todo_items
+            ) or "暂无待办"
+        elif self.mode == "倒计时":
+            content = str(self.timer_label.cget("text"))
         else:
-            self.empty_note_label.place_forget()
+            content = (
+                str(self.clock_time_label.cget("text")),
+                str(self.clock_date_label.cget("text")),
+            )
+        snapshot = (self.mode, canvas_width, canvas_height, content)
+        if snapshot == self._outline_snapshot:
+            return
+        self._outline_snapshot = snapshot
+        self.outlined_canvas.delete("all")
+
+        if self.mode == "便签":
+            if note.strip():
+                self._draw_outlined_text(
+                    note,
+                    12,
+                    8,
+                    font=("Microsoft YaHei UI", 11, "bold"),
+                    anchor="nw",
+                    width=canvas_width - 24,
+                )
+            else:
+                self._draw_outlined_text(
+                    "空便签",
+                    canvas_width // 2,
+                    canvas_height // 2,
+                    font=("Microsoft YaHei UI", 12, "bold"),
+                )
+        elif self.mode == "待办":
+            self._draw_outlined_text(
+                content,
+                12 if self.todo_items else canvas_width // 2,
+                8 if self.todo_items else canvas_height // 2,
+                font=("Microsoft YaHei UI", 10, "bold"),
+                anchor="nw" if self.todo_items else "center",
+                width=canvas_width - 24 if self.todo_items else 0,
+            )
+        elif self.mode == "倒计时":
+            self._draw_outlined_text(
+                content,
+                canvas_width // 2,
+                canvas_height // 2,
+                font=("Segoe UI", 30, "bold"),
+                large=True,
+            )
+        else:
+            clock_time, clock_date = content
+            self._draw_outlined_text(
+                clock_time,
+                canvas_width // 2,
+                canvas_height * 2 // 5,
+                font=("Segoe UI", 30, "bold"),
+                large=True,
+            )
+            self._draw_outlined_text(
+                clock_date,
+                canvas_width // 2,
+                canvas_height * 3 // 4,
+                font=("Microsoft YaHei UI", 10, "bold"),
+            )
+
+    def _set_outlined_view(self, visible: bool) -> None:
+        if visible:
+            self.note_text.pack_forget()
+            self.todo_list.pack_forget()
+            self.timer_label.pack_forget()
+            self.clock_time_label.pack_forget()
+            self.clock_date_label.pack_forget()
+            self.outlined_canvas.place(
+                relx=0,
+                rely=0,
+                relwidth=1,
+                relheight=1,
+            )
+            self._outline_snapshot = None
+            self._refresh_outlined_content()
+        else:
+            self.outlined_canvas.place_forget()
+            self.note_text.pack(fill="both", expand=True)
+            self.todo_list.pack(fill="both", expand=True)
+            self.timer_label.pack(expand=True)
+            self.clock_time_label.pack(expand=True)
+            self.clock_date_label.pack(pady=(0, 8))
+            self._outline_snapshot = None
 
     def _add_todo(self, _event: tk.Event | None = None) -> None:
         title = self.todo_input.get().strip()
@@ -1417,6 +1551,7 @@ class OverlayApp:
             self.todo_list.insert("end", f"{'☑' if done else '☐'}  {title}")
         if selected is not None and selected < len(self.todo_items):
             self.todo_list.selection_set(selected)
+        self._refresh_outlined_content()
 
     def _toggle_todo(self, _event: tk.Event | None = None) -> None:
         selected = self._selected_todo_index()
@@ -1465,12 +1600,9 @@ class OverlayApp:
         minutes, seconds = divmod(remaining, 60)
         self.timer_label.configure(
             text=f"{minutes:02d}:{seconds:02d}",
-            fg=(
-                CLOSE_HOVER
-                if remaining == 0
-                else NO_BACKGROUND_TEXT if self._background_hidden else TEXT
-            ),
+            fg=CLOSE_HOVER if remaining == 0 else TEXT,
         )
+        self._refresh_outlined_content()
 
     def _tick_modes(self) -> None:
         self._tick_after_id = None
@@ -1491,6 +1623,7 @@ class OverlayApp:
         self.clock_date_label.configure(
             text=f"{now.tm_year:04d}-{now.tm_mon:02d}-{now.tm_mday:02d}  星期{weekday}"
         )
+        self._refresh_outlined_content()
         self._tick_after_id = self.root.after(250, self._tick_modes)
 
     def _build_lock_window(self) -> None:
@@ -2031,6 +2164,7 @@ class OverlayApp:
             self.todo_entry_row.pack_forget()
             self.todo_actions.pack_forget()
             self.timer_actions.pack_forget()
+            self._set_outlined_view(True)
         else:
             for widget, options in self._constant_styles:
                 widget.configure(**options)
@@ -2044,25 +2178,11 @@ class OverlayApp:
             self.todo_entry_row.pack(
                 fill="x",
                 pady=(0, 5),
-                before=self.todo_list,
             )
+            self._set_outlined_view(False)
             self.todo_actions.pack(fill="x", pady=(4, 0))
             self.timer_actions.pack(pady=(0, 4))
             self._apply_control_colors()
-        self._apply_content_colors()
-        self.empty_note_label.configure(
-            fg=NO_BACKGROUND_MUTED if self._background_hidden else TEXT_MUTED
-        )
-        self._refresh_empty_note_label()
-
-    def _apply_content_colors(self) -> None:
-        text_color = NO_BACKGROUND_TEXT if self._background_hidden else TEXT
-        muted_color = NO_BACKGROUND_MUTED if self._background_hidden else TEXT_MUTED
-        self.note_text.configure(fg=text_color)
-        self.todo_list.configure(fg=text_color, selectforeground=text_color)
-        self.clock_time_label.configure(fg=text_color)
-        self.clock_date_label.configure(fg=muted_color)
-        self._update_timer_display()
 
     def _apply_layered_style(self) -> None:
         if self._closed:
@@ -2114,7 +2234,6 @@ class OverlayApp:
             # Keep the useful content visible and click-through, but suppress
             # all chrome even when the cursor hovers over the window.
             self._set_background_hidden(True)
-            self._refresh_empty_note_label()
         else:
             self.unlock_canvas.pack_forget()
             self.lock_button.pack(fill="both", expand=True)
@@ -2660,6 +2779,21 @@ class DesktopManager:
 
 
 def _self_test() -> None:
+    def outlined_text(window: OverlayApp) -> list[str]:
+        canvas = window.outlined_canvas
+        fill_items = canvas.find_withtag("outlined-fill")
+        stroke_items = canvas.find_withtag("outlined-stroke")
+        assert fill_items and stroke_items, "outlined foreground was not drawn"
+        assert all(
+            canvas.itemcget(item, "fill") == OUTLINED_TEXT_FILL
+            for item in fill_items
+        )
+        assert all(
+            canvas.itemcget(item, "fill") == OUTLINED_TEXT_STROKE
+            for item in stroke_items
+        )
+        return [canvas.itemcget(item, "text") for item in fill_items]
+
     app = OverlayApp(visible=False)
     app.root.update()
     assert _position_from_arguments(["--position", "-120", "80"]) == (-120, 80)
@@ -2731,25 +2865,29 @@ def _self_test() -> None:
     assert app.mode_button.cget("fg") == TRANSPARENT_KEY
     assert app.mode_button.cget("text") == ""
     assert app.note_text.cget("bg") == TRANSPARENT_KEY
-    assert app.note_text.cget("fg") == NO_BACKGROUND_TEXT
+    assert app.note_text.winfo_manager() == ""
+    assert app.outlined_canvas.winfo_manager() == "place"
+    assert "临时想法" in outlined_text(app)
     assert app.note_text.get("1.0", "end-1c") == "临时想法"
     app.note_text.delete("1.0", "end")
     app.root.update()
-    assert app.empty_note_label.winfo_manager() == "place"
-    assert app.empty_note_label.cget("text") == "空便签"
+    assert "空便签" in outlined_text(app)
     app.note_text.insert("1.0", "再次写入")
     app.root.update()
-    assert app.empty_note_label.winfo_manager() == ""
+    assert "再次写入" in outlined_text(app)
     app.set_mode("待办")
     assert app.todo_entry_row.winfo_manager() == ""
     assert app.todo_actions.winfo_manager() == ""
-    assert app.todo_list.cget("fg") == NO_BACKGROUND_TEXT
+    assert app.todo_list.winfo_manager() == ""
+    assert "☑  检查切换" in outlined_text(app)
     app.set_mode("倒计时")
     assert app.timer_actions.winfo_manager() == ""
-    assert app.timer_label.cget("fg") == NO_BACKGROUND_TEXT
+    assert app.timer_label.winfo_manager() == ""
+    assert "02:00" in outlined_text(app)
     app.set_mode("时钟")
     assert app.clock_time_label.cget("bg") == TRANSPARENT_KEY
-    assert app.clock_time_label.cget("fg") == NO_BACKGROUND_TEXT
+    assert app.clock_time_label.winfo_manager() == ""
+    assert app.clock_time_label.cget("text") in outlined_text(app)
     app.set_mode("便签")
     layered_key = wintypes.DWORD()
     layered_alpha = ctypes.c_ubyte()
@@ -2780,6 +2918,8 @@ def _self_test() -> None:
     assert app.close_button.cget("fg") == TEXT
     assert app.lock_button.cget("fg") == "#102219"
     assert app.note_text.cget("fg") == TEXT
+    assert app.note_text.winfo_manager() == "pack"
+    assert app.outlined_canvas.winfo_manager() == ""
     assert app.todo_entry_row.winfo_manager() == "pack"
     assert app.timer_actions.winfo_manager() == "pack"
     layered_flags = wintypes.DWORD()
@@ -2841,9 +2981,10 @@ def _self_test() -> None:
     assert visible_lock_app.root.state() == "normal"
     assert visible_lock_app._background_hidden
     assert visible_lock_app.click_through_style_is_set()
-    assert visible_lock_app.note_text.winfo_ismapped()
+    assert visible_lock_app.outlined_canvas.winfo_ismapped()
+    assert not visible_lock_app.note_text.winfo_ismapped()
     assert visible_lock_app.note_text.get("1.0", "end-1c") == "锁定后保留内容"
-    assert visible_lock_app.note_text.cget("fg") == NO_BACKGROUND_TEXT
+    assert "锁定后保留内容" in outlined_text(visible_lock_app)
     assert visible_lock_app.title_label.cget("text") == ""
     assert visible_lock_app.lock_window.state() == "normal"
     assert visible_lock_app.unlock_canvas.winfo_manager() == "pack"
@@ -2859,7 +3000,7 @@ def _self_test() -> None:
     assert visible_lock_app.title_label.cget("text") == ""
     visible_lock_app.note_text.delete("1.0", "end")
     visible_lock_app.root.update()
-    assert visible_lock_app.empty_note_label.winfo_ismapped(), (
+    assert "空便签" in outlined_text(visible_lock_app), (
         "empty locked note became invisible"
     )
     visible_lock_app.unlock_canvas.event_generate(
@@ -2880,7 +3021,7 @@ def _self_test() -> None:
     visible_lock_app.root.update()
     assert visible_lock_app.root.state() == "normal"
     assert visible_lock_app._background_hidden
-    assert visible_lock_app.empty_note_label.winfo_ismapped()
+    assert "空便签" in outlined_text(visible_lock_app)
     visible_lock_app.set_locked(False)
     visible_lock_app.root.update()
     assert visible_lock_app.root.state() == "normal"
