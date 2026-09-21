@@ -17,6 +17,7 @@ import tkinter as tk
 import tkinter.messagebox as messagebox
 import tkinter.simpledialog as simpledialog
 import urllib.error
+import urllib.parse
 import urllib.request
 import winreg
 from collections import deque
@@ -27,7 +28,7 @@ from queue import Empty, Queue
 
 
 APP_TITLE = "DesktopTools 自由窗口"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 UPDATE_MANIFEST_URL = (
     "https://raw.githubusercontent.com/FennecMomo/DesktopTools/"
     "main/dist/update.json"
@@ -57,7 +58,10 @@ ANIMATION_STEPS = 10
 ANIMATION_DELAY_MS = 14
 HOVER_POLL_MS = 90
 HOVER_MARGIN = 16
-WINDOW_MODES = ("便签", "待办", "任务胶囊", "倒计时", "时钟", "快捷按键")
+WINDOW_MODES = ("便签", "待办", "任务胶囊", "倒计时", "时钟", "快捷按键", "浏览器")
+DEFAULT_BROWSER_URL = "https://www.bing.com/"
+BROWSER_MIN_WIDTH = 760
+BROWSER_MIN_HEIGHT = 520
 MODE_HINTS = {
     "便签": "把临时想法放在手边",
     "待办": "双击切换完成；选中后可编辑或删除",
@@ -65,6 +69,7 @@ MODE_HINTS = {
     "倒计时": "专注、休息或提醒自己换个任务",
     "时钟": "开会或全屏工作时也能看到时间",
     "快捷按键": "一键执行常用操作",
+    "浏览器": "在自由窗口中浏览网页",
 }
 
 BG_OUTER = "#11141A"
@@ -105,8 +110,11 @@ WM_HOTKEY = 0x0312
 WM_APP = 0x8000
 TRAY_CALLBACK_MESSAGE = WM_APP + 20
 QUICK_CAPTURE_HOTKEY_ID = 1
+HIDE_HOTKEY_IDS = (2, 3)
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
+MOD_SHIFT = 0x0004
+MOD_NOREPEAT = 0x4000
 GW_OWNER = 4
 SW_RESTORE = 9
 DWMWA_CLOAKED = 14
@@ -131,6 +139,7 @@ TRAY_COMMAND_SETTINGS = 1002
 TRAY_COMMAND_EXIT = 1003
 TRAY_COMMAND_UPDATE = 1004
 TRAY_COMMAND_CAPTURE = 1005
+TRAY_COMMAND_VISIBILITY = 1006
 IDI_APPLICATION = 32512
 MIIM_BITMAP = 0x00000080
 DIB_RGB_COLORS = 0
@@ -643,6 +652,64 @@ def _default_settings_path() -> Path:
     return Path.home() / "AppData" / "Local" / "DesktopTools" / "settings.json"
 
 
+def _browser_destination(address: str) -> str:
+    value = address.strip()
+    if not value:
+        return DEFAULT_BROWSER_URL
+    if len(value) > 8192:
+        raise ValueError("网址过长")
+    if any(character.isspace() for character in value):
+        return "https://www.bing.com/search?q=" + urllib.parse.quote_plus(value)
+    if "://" not in value:
+        if ":" in value and "." not in value.split(":", 1)[0] and not value.startswith("localhost:"):
+            raise ValueError("仅支持 http:// 或 https:// 网页")
+        if "." not in value and not value.startswith("localhost:"):
+            return "https://www.bing.com/search?q=" + urllib.parse.quote_plus(value)
+        scheme = "http://" if value.startswith(("localhost:", "127.0.0.1:")) else "https://"
+        value = scheme + value
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("仅支持有效的 http:// 或 https:// 网址")
+    return value
+
+
+def _parse_hide_hotkey(value: str) -> tuple[str, int, int]:
+    if not isinstance(value, str):
+        raise ValueError("请输入快捷键组合，例如 Ctrl+K")
+    parts = [part.strip().lower() for part in value.split("+")]
+    if len(parts) < 2 or any(not part for part in parts):
+        raise ValueError("请输入快捷键组合，例如 Ctrl+K")
+    aliases = {"control": "ctrl"}
+    names = {
+        "ctrl": ("Ctrl", MOD_CONTROL),
+        "alt": ("Alt", MOD_ALT),
+        "shift": ("Shift", MOD_SHIFT),
+    }
+    modifiers = 0
+    seen: set[str] = set()
+    for part in parts[:-1]:
+        name = aliases.get(part, part)
+        if name not in names or name in seen:
+            raise ValueError("修饰键仅支持 Ctrl、Alt、Shift，且不能重复")
+        seen.add(name)
+        modifiers |= names[name][1]
+    if not modifiers & (MOD_CONTROL | MOD_ALT):
+        raise ValueError("快捷隐藏至少需要 Ctrl 或 Alt")
+    key_name = parts[-1].upper()
+    if len(key_name) == 1 and key_name in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789":
+        virtual_key = ord(key_name)
+    elif key_name.startswith("F") and key_name[1:].isdigit() and 1 <= int(key_name[1:]) <= 12:
+        number = int(key_name[1:])
+        key_name = f"F{number}"
+        virtual_key = 0x70 + number - 1
+    else:
+        raise ValueError("主键只支持 A–Z、0–9 或 F1–F12")
+    if modifiers == (MOD_CONTROL | MOD_ALT) and key_name == "D":
+        raise ValueError("Ctrl+Alt+D 已用于快速收集")
+    label = "+".join(names[name][0] for name in ("ctrl", "alt", "shift") if name in seen)
+    return f"{label}+{key_name}", modifiers, virtual_key
+
+
 class SettingsStore:
     DEFAULTS = {
         "opacity_percent": 86,
@@ -650,12 +717,13 @@ class SettingsStore:
         "restore_margin": RESTORE_MARGIN,
         "no_background": False,
         "auto_update": False,
+        "hide_hotkey": "Ctrl+K",
     }
 
     def __init__(self, path: Path | None = None) -> None:
         self.path = Path(path) if path is not None else _default_settings_path()
 
-    def load(self) -> dict[str, int | bool]:
+    def load(self) -> dict[str, int | bool | str]:
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError):
@@ -686,15 +754,21 @@ class SettingsStore:
         if not isinstance(auto_update, bool):
             auto_update = self.DEFAULTS["auto_update"]
 
+        try:
+            hide_hotkey = _parse_hide_hotkey(raw.get("hide_hotkey"))[0]
+        except ValueError:
+            hide_hotkey = self.DEFAULTS["hide_hotkey"]
+
         return {
             "opacity_percent": _clamp(round(opacity), 55, 100),
             "edge_collapse_enabled": edge_collapse,
             "restore_margin": _clamp(round(restore_margin), 0, 80),
             "no_background": no_background,
             "auto_update": auto_update,
+            "hide_hotkey": hide_hotkey,
         }
 
-    def save(self, settings: dict[str, int | bool]) -> None:
+    def save(self, settings: dict[str, int | bool | str]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "version": 1,
@@ -703,6 +777,7 @@ class SettingsStore:
             "restore_margin": _clamp(int(settings["restore_margin"]), 0, 80),
             "no_background": bool(settings["no_background"]),
             "auto_update": bool(settings["auto_update"]),
+            "hide_hotkey": _parse_hide_hotkey(settings["hide_hotkey"])[0],
         }
         descriptor, temporary_name = tempfile.mkstemp(
             prefix="settings-",
@@ -860,6 +935,10 @@ class WindowStateStore:
                 and self._valid_geometry(ball_geometry)
                 and dock_edge in ("left", "right", "top", "bottom")
             )
+            try:
+                browser_url = _browser_destination(item.get("browser_url", ""))
+            except (TypeError, ValueError):
+                browser_url = DEFAULT_BROWSER_URL
             window_record = {
                 "id": number,
                 "task_id": task_id,
@@ -873,6 +952,7 @@ class WindowStateStore:
                 "locked": item.get("locked") is True and not collapsed,
                 "ball_geometry": list(ball_geometry) if collapsed else None,
                 "dock_edge": dock_edge if collapsed else None,
+                "browser_url": browser_url,
             }
             if not has_tasks:
                 window_record.update(
@@ -1238,6 +1318,12 @@ def _menu_icon_color(kind: str, x: float, y: float) -> tuple[int, int, int] | No
                 return 245, 184, 92
         return None
 
+    if kind == "visibility":
+        ellipse = (dx / 6.3) ** 2 + (dy / 3.5) ** 2
+        if abs(ellipse - 1) <= 0.26 or radius <= 1.8:
+            return 177, 145, 235
+        return None
+
     if kind == "exit":
         ring_center_y = 8.25
         ring_dx = x - center
@@ -1313,7 +1399,9 @@ class SystemTrayIcon:
         on_settings: Callable[[], None],
         on_update: Callable[[], None],
         on_capture: Callable[[], None],
+        on_toggle_visibility: Callable[[], None],
         on_exit: Callable[[], None],
+        hide_hotkey: str,
         show_icon: bool = True,
     ) -> None:
         self.root = root
@@ -1321,11 +1409,14 @@ class SystemTrayIcon:
         self.on_settings = on_settings
         self.on_update = on_update
         self.on_capture = on_capture
+        self.on_toggle_visibility = on_toggle_visibility
         self.on_exit = on_exit
         self.show_icon = show_icon
         self._cleaned = False
         self._icon_added = False
         self.hotkey_registered = False
+        self.hide_hotkey = _parse_hide_hotkey(hide_hotkey)[0]
+        self._hide_hotkey_id: int | None = None
         self._menu_bitmaps: dict[int, int] = {}
         self._pending_actions: deque[Callable[[], None]] = deque()
         self._drain_after_id: str | None = None
@@ -1377,6 +1468,7 @@ class SystemTrayIcon:
             TRAY_COMMAND_SETTINGS: _create_menu_bitmap("settings"),
             TRAY_COMMAND_UPDATE: _create_menu_bitmap("update"),
             TRAY_COMMAND_CAPTURE: _create_menu_bitmap("capture"),
+            TRAY_COMMAND_VISIBILITY: _create_menu_bitmap("visibility"),
             TRAY_COMMAND_EXIT: _create_menu_bitmap("exit"),
         }
 
@@ -1399,7 +1491,33 @@ class SystemTrayIcon:
                     ord("D"),
                 )
             )
+            self.set_hide_hotkey(self.hide_hotkey)
         self._drain_after_id = self.root.after(40, self._drain_actions)
+
+    @property
+    def hide_hotkey_registered(self) -> bool:
+        return self._hide_hotkey_id is not None
+
+    def set_hide_hotkey(self, binding: str) -> bool:
+        canonical, modifiers, virtual_key = _parse_hide_hotkey(binding)
+        if not self.show_icon:
+            self.hide_hotkey = canonical
+            return True
+        if canonical == self.hide_hotkey and self._hide_hotkey_id is not None:
+            return True
+        candidate_id = next(
+            identifier for identifier in HIDE_HOTKEY_IDS
+            if identifier != self._hide_hotkey_id
+        )
+        if not user32.RegisterHotKey(
+            self.hwnd, candidate_id, modifiers | MOD_NOREPEAT, virtual_key
+        ):
+            return False
+        if self._hide_hotkey_id is not None:
+            user32.UnregisterHotKey(self.hwnd, self._hide_hotkey_id)
+        self._hide_hotkey_id = candidate_id
+        self.hide_hotkey = canonical
+        return True
 
     def _add_icon(self) -> None:
         if not shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self._notify_data)):
@@ -1445,6 +1563,9 @@ class SystemTrayIcon:
         if message == WM_HOTKEY and int(w_param) == QUICK_CAPTURE_HOTKEY_ID:
             self._schedule(self.on_capture)
             return 0
+        if message == WM_HOTKEY and int(w_param) == self._hide_hotkey_id:
+            self._schedule(self.on_toggle_visibility)
+            return 0
 
         if message == WM_DESTROY:
             return 0
@@ -1462,6 +1583,13 @@ class SystemTrayIcon:
                 if self.hotkey_registered else "快速收集（快捷键被占用）"
             )
             user32.AppendMenuW(menu, MF_STRING, TRAY_COMMAND_CAPTURE, capture_label)
+            visibility_label = (
+                f"隐藏/显示全部窗口（{self.hide_hotkey}）"
+                if self.hide_hotkey_registered else "隐藏/显示全部窗口（快捷键被占用）"
+            )
+            user32.AppendMenuW(
+                menu, MF_STRING, TRAY_COMMAND_VISIBILITY, visibility_label
+            )
             user32.AppendMenuW(menu, MF_STRING, TRAY_COMMAND_SETTINGS, "设置")
             user32.AppendMenuW(menu, MF_STRING, TRAY_COMMAND_UPDATE, "检查更新")
             user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
@@ -1537,6 +1665,7 @@ class SystemTrayIcon:
             TRAY_COMMAND_SETTINGS: self.on_settings,
             TRAY_COMMAND_UPDATE: self.on_update,
             TRAY_COMMAND_CAPTURE: self.on_capture,
+            TRAY_COMMAND_VISIBILITY: self.on_toggle_visibility,
             TRAY_COMMAND_EXIT: self.on_exit,
         }
         action = actions.get(command)
@@ -1550,6 +1679,9 @@ class SystemTrayIcon:
         if self.hotkey_registered:
             user32.UnregisterHotKey(self.hwnd, QUICK_CAPTURE_HOTKEY_ID)
             self.hotkey_registered = False
+        if self._hide_hotkey_id is not None:
+            user32.UnregisterHotKey(self.hwnd, self._hide_hotkey_id)
+            self._hide_hotkey_id = None
         if self._drain_after_id is not None:
             try:
                 self.root.after_cancel(self._drain_after_id)
@@ -1591,6 +1723,8 @@ class OverlayApp:
         on_open_focus: Callable[["OverlayApp"], None] | None = None,
         on_bind_task: Callable[["OverlayApp", int], None] | None = None,
         on_list_tasks: Callable[[], list[int]] | None = None,
+        browser_data_dir: Path | None = None,
+        browser_session_factory: Callable[[], object] | None = None,
     ) -> None:
         self.visible = visible
         self.on_close = on_close
@@ -1617,10 +1751,21 @@ class OverlayApp:
         self._dock_edge: str | None = None
         self._sync_scheduled = False
         self.mode = WINDOW_MODES[0]
+        self._browser_first_open = (
+            saved_state is None or saved_state.get("mode") != "浏览器"
+        )
         self._editing_todo_index: int | None = None
         self._switch_targets: list[int] = []
         self._switch_index = 0
         self._tick_after_id: str | None = None
+        self.browser_url = (
+            str(saved_state.get("browser_url", DEFAULT_BROWSER_URL))
+            if saved_state is not None else DEFAULT_BROWSER_URL
+        )
+        self.browser_data_dir = browser_data_dir or _default_settings_path().parent / "browser"
+        self._browser_session_factory = browser_session_factory
+        self._browser_owned_session: object | None = None
+        self._browser_web: object | None = None
         self.root = tk.Tk() if master is None else tk.Toplevel(master)
         if not visible or (saved_state is not None and saved_state["collapsed"]):
             self.root.withdraw()
@@ -1638,6 +1783,7 @@ class OverlayApp:
             master=self.root,
             value=False,
         )
+        self.browser_address = tk.StringVar(master=self.root, value=self.browser_url)
 
         self.root.title(f"{APP_TITLE} #{instance_number}")
         self.root.overrideredirect(True)
@@ -1845,6 +1991,7 @@ class OverlayApp:
             "locked": self.locked,
             "ball_geometry": list(self._ball_geometry) if self.collapsed else None,
             "dock_edge": self._dock_edge if self.collapsed else None,
+            "browser_url": self.browser_url,
         }
 
     def _notify_state_changed(self) -> None:
@@ -2363,6 +2510,72 @@ class OverlayApp:
             )
             self.shortcut_buttons.append(button)
 
+        browser_view = self.mode_views["浏览器"]
+        self.browser_toolbar = tk.Frame(browser_view, bg=BG_PANEL)
+        self.browser_toolbar.pack(fill="x", pady=(0, 6))
+        self._register_mode_style(self.browser_toolbar, bg=BG_PANEL)
+        for label, action in (
+            ("‹", self._browser_back),
+            ("›", self._browser_forward),
+            ("↻", self._browser_reload),
+        ):
+            button = tk.Button(
+                self.browser_toolbar,
+                text=label,
+                command=action,
+                bg=BG_BODY,
+                fg=TEXT,
+                relief="flat",
+                bd=0,
+                width=3,
+                cursor="hand2",
+                takefocus=False,
+            )
+            button.pack(side="left", padx=(0, 4))
+            self._register_mode_style(button, bg=BG_BODY, fg=TEXT)
+        self.browser_entry = tk.Entry(
+            self.browser_toolbar,
+            textvariable=self.browser_address,
+            bg=BG_BODY,
+            fg=TEXT,
+            insertbackground=ACCENT,
+            relief="flat",
+            bd=0,
+        )
+        self.browser_entry.pack(side="left", fill="x", expand=True, ipady=5)
+        self.browser_entry.bind("<Return>", self._browser_navigate)
+        self._register_mode_style(self.browser_entry, bg=BG_BODY, fg=TEXT)
+        go_button = tk.Button(
+            self.browser_toolbar,
+            text="前往",
+            command=self._browser_navigate,
+            bg=ACCENT,
+            fg="#102219",
+            relief="flat",
+            bd=0,
+            cursor="hand2",
+            takefocus=False,
+        )
+        go_button.pack(side="left", padx=(4, 0))
+        self._register_mode_style(go_button, bg=ACCENT, fg="#102219")
+        self.browser_error_label = tk.Label(
+            browser_view,
+            text="",
+            bg=BG_PANEL,
+            fg=CLOSE_HOVER,
+            justify="left",
+            wraplength=430,
+        )
+        self._register_mode_style(self.browser_error_label, bg=BG_PANEL, fg=CLOSE_HOVER)
+        self.browser_host = tk.Frame(browser_view, bg=BG_PANEL)
+        self.browser_host.pack(fill="both", expand=True)
+        self._register_mode_style(self.browser_host, bg=BG_PANEL)
+        self.browser_host.bind(
+            "<Map>",
+            lambda _event: self.root.after(20, self._ensure_browser_view),
+            add="+",
+        )
+
         self.mode_views[self.mode].pack(fill="both", expand=True)
 
         self.outlined_canvas = tk.Canvas(
@@ -2446,8 +2659,136 @@ class OverlayApp:
         self._sync_shortcut_window()
         if self._background_hidden:
             self._apply_background_state()
+        elif mode == "浏览器":
+            self.status_label.pack_forget()
+            self.message_label.pack_forget()
+        else:
+            self.status_label.pack(pady=(10, 2), before=self.mode_container)
+            self.message_label.pack(before=self.mode_container)
+        self._refresh_outlined_content()
+        if mode == "浏览器":
+            if self._browser_first_open:
+                self._browser_first_open = False
+                self._expand_for_browser()
+            self.root.after_idle(self._ensure_browser_view)
+        self._notify_state_changed()
+
+    def _expand_for_browser(self) -> None:
+        if not self.visible or self.collapsed or self.animating:
+            return
+        width, height, x, y = _native_window_geometry(self.root)
+        if width >= BROWSER_MIN_WIDTH and height >= BROWSER_MIN_HEIGHT:
+            return
+        _, (left, top, right, bottom) = _monitor_areas_at(
+            x + width // 2, y + height // 2
+        )
+        margin = self._restore_margin_pixels()
+        width = min(max(width, BROWSER_MIN_WIDTH), max(1, right - left - 2 * margin))
+        height = min(max(height, BROWSER_MIN_HEIGHT), max(1, bottom - top - 2 * margin))
+        x = _clamp(x, left + margin, right - width - margin)
+        y = _clamp(y, top + margin, bottom - height - margin)
+        _set_absolute_geometry(self.root, width=width, height=height, x=x, y=y)
+
+    def _browser_navigate(self, _event: tk.Event | None = None) -> None:
+        try:
+            destination = _browser_destination(self.browser_address.get())
+        except ValueError as error:
+            self._browser_show_error(str(error))
+            return
+        self.browser_url = destination
+        self.browser_address.set(destination)
+        self.browser_error_label.pack_forget()
         self._refresh_outlined_content()
         self._notify_state_changed()
+        if self._browser_web is None:
+            self._ensure_browser_view()
+        else:
+            try:
+                self._browser_web.load_url(destination)
+            except (OSError, RuntimeError, ValueError) as error:
+                self._browser_show_error(f"网页打开失败：{error}")
+
+    def _browser_show_error(self, message: str) -> None:
+        if self._closed:
+            return
+        self.browser_error_label.configure(text=message)
+        if not self._background_hidden:
+            self.browser_error_label.pack(fill="x", pady=(0, 5), before=self.browser_host)
+
+    def _browser_page_loaded(self, _event: object, url: str) -> None:
+        if self._closed or urllib.parse.urlsplit(url).scheme not in ("http", "https"):
+            return
+        if self.browser_url != url:
+            self.browser_url = url
+            self._refresh_outlined_content()
+            self._notify_state_changed()
+        if self.root.focus_get() is not self.browser_entry:
+            self.browser_address.set(url)
+
+    def _ensure_browser_view(self) -> None:
+        if (
+            self._closed or self._browser_web is not None or not self.visible
+            or self.mode != "浏览器" or self.collapsed or self.animating
+            or self._background_hidden or not self.browser_host.winfo_ismapped()
+        ):
+            return
+        try:
+            from tkwry import WebSession, WebView
+
+            if self._browser_session_factory is None:
+                self.browser_data_dir.mkdir(parents=True, exist_ok=True)
+                if self._browser_owned_session is None:
+                    self._browser_owned_session = WebSession(
+                        data_directory=self.browser_data_dir
+                    )
+                session = self._browser_owned_session
+            else:
+                session = self._browser_session_factory()
+            self._browser_web = WebView(
+                self.browser_host,
+                url=self.browser_url,
+                session=session,
+                bridge_origins=["https://desktoptools.invalid"],
+                on_navigation=lambda event: urllib.parse.urlsplit(event.url).scheme
+                in ("http", "https"),
+                on_download=lambda _download: False,
+                on_page_load=self._browser_page_loaded,
+                on_creation_failed=lambda error: self._browser_show_error(
+                    f"浏览器启动失败：{error}"
+                ),
+            )
+        except (ImportError, OSError, RuntimeError, ValueError) as error:
+            self._browser_show_error(
+                f"浏览器启动失败：{error}。源码运行请安装 tkwry==0.1.9，"
+                "并确认系统已安装 WebView2 Runtime。"
+            )
+
+    def _browser_action(self, name: str) -> None:
+        if self._browser_web is None:
+            self._ensure_browser_view()
+            return
+        try:
+            getattr(self._browser_web, name)()
+        except (OSError, RuntimeError, ValueError) as error:
+            self._browser_show_error(f"网页操作失败：{error}")
+
+    def _browser_back(self) -> None:
+        self._browser_action("go_back")
+
+    def _browser_forward(self) -> None:
+        self._browser_action("go_forward")
+
+    def _browser_reload(self) -> None:
+        if self._browser_web is not None and getattr(
+            self._browser_web, "creation_failed", False
+        ):
+            self._browser_web.destroy()
+            self._browser_web = None
+            self.browser_error_label.pack_forget()
+            self.browser_host.pack(fill="both", expand=True)
+            self._ensure_browser_view()
+        else:
+            self._browser_action("reload")
 
     def _on_note_modified(self, _event: tk.Event) -> None:
         if not self.note_text.edit_modified():
@@ -2527,6 +2868,8 @@ class OverlayApp:
                 f"{label}（{hint}）"
                 for label, hint, _action, _icon in self._shortcut_definitions()
             )
+        elif self.mode == "浏览器":
+            content = self.browser_url
         else:
             content = (
                 str(self.clock_time_label.cget("text")),
@@ -2596,6 +2939,15 @@ class OverlayApp:
                 font=("Microsoft YaHei UI", 12, "bold"),
                 width=canvas_width - 24,
             )
+        elif self.mode == "浏览器":
+            hostname = urllib.parse.urlsplit(content).hostname or "网页"
+            self._draw_outlined_text(
+                f"{hostname}\n{content}",
+                canvas_width // 2,
+                canvas_height // 2,
+                font=("Microsoft YaHei UI", 11, "bold"),
+                width=canvas_width - 24,
+            )
         else:
             clock_time, clock_date = content
             self._draw_outlined_text(
@@ -2623,6 +2975,9 @@ class OverlayApp:
             self.clock_time_label.pack_forget()
             self.clock_date_label.pack_forget()
             self.shortcut_buttons_frame.pack_forget()
+            self.browser_toolbar.pack_forget()
+            self.browser_host.pack_forget()
+            self.browser_error_label.pack_forget()
             self.outlined_canvas.place(
                 relx=0,
                 rely=0,
@@ -2642,7 +2997,13 @@ class OverlayApp:
             self.clock_time_label.pack(expand=True)
             self.clock_date_label.pack(pady=(0, 8))
             self.shortcut_buttons_frame.pack(fill="x")
+            self.browser_toolbar.pack(fill="x", pady=(0, 6))
+            if self.browser_error_label.cget("text"):
+                self.browser_error_label.pack(fill="x", pady=(0, 5))
+            self.browser_host.pack(fill="both", expand=True)
             self._outline_snapshot = None
+            if self.mode == "浏览器":
+                self.root.after_idle(self._ensure_browser_view)
 
     def _add_todo(self, _event: tk.Event | None = None) -> None:
         title = self.todo_input.get().strip()
@@ -3475,7 +3836,11 @@ class OverlayApp:
         self._ball_geometry = None
         self._dock_edge = None
         if self.visible:
+            self.root.deiconify()
+            self.root.attributes("-topmost", True)
             self.root.focus_force()
+        if self.mode == "浏览器":
+            self.root.after_idle(self._ensure_browser_view)
         self._sync_lock_window()
         self._notify_state_changed()
 
@@ -3630,8 +3995,9 @@ class OverlayApp:
             self.mode_button.configure(text=f"{self.mode} ▾")
             self.close_button.configure(text="×")
             self.resize_grip.configure(text="◢")
-            self.status_label.pack(pady=(10, 2), before=self.mode_container)
-            self.message_label.pack(before=self.mode_container)
+            if self.mode != "浏览器":
+                self.status_label.pack(pady=(10, 2), before=self.mode_container)
+                self.message_label.pack(before=self.mode_container)
             self.todo_entry_row.pack(
                 fill="x",
                 pady=(0, 5),
@@ -3788,6 +4154,12 @@ class OverlayApp:
                 self.shortcut_window.destroy()
         except (AttributeError, tk.TclError):
             pass
+        if self._browser_web is not None:
+            self._browser_web.destroy()
+            self._browser_web = None
+        if self._browser_owned_session is not None:
+            self._browser_owned_session.close()
+            self._browser_owned_session = None
         try:
             self.root.destroy()
         finally:
@@ -3800,6 +4172,37 @@ class OverlayApp:
         if self._closed:
             return
         self._apply_layered_style()
+
+    def set_overlay_visible(self, visible: bool) -> None:
+        """Temporarily hide every surface without changing saved window state."""
+        if self._closed:
+            return
+        self.visible = visible
+        if not visible:
+            for surface in (
+                self.root, self.ball_window, self.lock_window,
+                self.shortcut_window,
+            ):
+                surface.withdraw()
+            return
+        if self.animating:
+            # The animation completion handler restores the appropriate surface.
+            return
+        if self.collapsed:
+            self.root.withdraw()
+            self.ball_window.deiconify()
+            self.ball_window.attributes("-topmost", True)
+            _set_native_topmost(self.ball_window)
+            self._sync_shortcut_window()
+        else:
+            self.ball_window.withdraw()
+            self.shortcut_window.withdraw()
+            self.root.deiconify()
+            self.root.attributes("-topmost", True)
+            _set_native_topmost(self.root)
+            self._sync_lock_window()
+            if self.mode == "浏览器":
+                self.root.after_idle(self._ensure_browser_view)
 
     def run(self) -> None:
         self.root.mainloop()
@@ -3834,7 +4237,11 @@ class DesktopManager:
         self._staged_update: tuple[Path, str, str] | None = None
         self._restart_after_update = False
         self._update_message = f"当前版本 v{APP_VERSION}"
+        self.overlays_hidden = False
+        self._hidden_auxiliary: dict[str, bool] = {}
+        self._hide_hotkey_error: str | None = None
         self.windows: list[OverlayApp] = []
+        self._browser_session: object | None = None
         self.settings_window: tk.Toplevel | None = None
         self.quick_capture_window: tk.Toplevel | None = None
         self.quick_capture_text: tk.Text | None = None
@@ -3908,6 +4315,7 @@ class DesktopManager:
             master=self.root,
             value=saved_settings["auto_update"],
         )
+        self.hide_hotkey = str(saved_settings["hide_hotkey"])
         for setting_variable in (
             self.opacity_percent,
             self.edge_collapse_enabled,
@@ -3927,9 +4335,15 @@ class DesktopManager:
             on_settings=self.open_settings,
             on_update=self._tray_check_updates,
             on_capture=self.open_quick_capture,
+            on_toggle_visibility=self.toggle_overlays_hidden,
             on_exit=self.exit_app,
+            hide_hotkey=self.hide_hotkey,
             show_icon=tray_enabled,
         )
+        if tray_enabled and not self.tray.hide_hotkey_registered:
+            self._hide_hotkey_error = (
+                f"{self.hide_hotkey} 已被其他程序占用；请在设置中修改快捷隐藏键。"
+            )
 
         if stored_tasks is None and self._window_records:
             self._schedule_window_states_save()
@@ -3946,6 +4360,35 @@ class DesktopManager:
         self._hover_after_id = self.root.after(HOVER_POLL_MS, self._poll_hover)
         if self.auto_update.get() and getattr(sys, "frozen", False):
             self.root.after(1500, lambda: self.check_for_updates(manual=False))
+
+    def toggle_overlays_hidden(self) -> None:
+        if self._exiting:
+            return
+        self.overlays_hidden = not self.overlays_hidden
+        if self.overlays_hidden:
+            self._hidden_auxiliary.clear()
+            for name in ("settings_window", "quick_capture_window"):
+                surface = getattr(self, name)
+                try:
+                    was_visible = surface is not None and surface.winfo_exists() and surface.state() == "normal"
+                    self._hidden_auxiliary[name] = was_visible
+                    if was_visible:
+                        surface.withdraw()
+                except tk.TclError:
+                    self._hidden_auxiliary[name] = False
+        for window in tuple(self.windows):
+            window.set_overlay_visible(self.visible and not self.overlays_hidden)
+        if not self.overlays_hidden:
+            self._refresh_backgrounds()
+            for name, was_visible in self._hidden_auxiliary.items():
+                surface = getattr(self, name)
+                try:
+                    if was_visible and surface is not None and surface.winfo_exists() and surface.state() == "withdrawn":
+                        surface.deiconify()
+                        surface.attributes("-topmost", True)
+                except tk.TclError:
+                    pass
+            self._hidden_auxiliary.clear()
 
     def add_window(
         self,
@@ -3975,6 +4418,15 @@ class DesktopManager:
             None, initial_position=initial_position, task_id=task_id
         )
 
+    def _get_browser_session(self) -> object:
+        if self._browser_session is None:
+            from tkwry import WebSession
+
+            browser_directory = self.settings_store.path.parent / "browser"
+            browser_directory.mkdir(parents=True, exist_ok=True)
+            self._browser_session = WebSession(data_directory=browser_directory)
+        return self._browser_session
+
     def _open_window(
         self,
         saved_state: dict[str, object] | None,
@@ -3997,7 +4449,7 @@ class DesktopManager:
         )
 
         window = OverlayApp(
-            visible=self.visible,
+            visible=self.visible and not self.overlays_hidden,
             initial_position=initial_position,
             master=self.root,
             on_close=self._on_window_closed,
@@ -4013,6 +4465,7 @@ class DesktopManager:
             on_open_focus=self._open_focus_window,
             on_bind_task=self.bind_window_to_task,
             on_list_tasks=lambda: sorted(self._tasks),
+            browser_session_factory=self._get_browser_session,
         )
         if saved_state is None:
             self._next_instance_number += 1
@@ -4373,7 +4826,7 @@ class DesktopManager:
             fg=TEXT,
             font=("Microsoft YaHei UI", 13, "bold"),
             anchor="w",
-        ).pack(fill="x", padx=22, pady=(20, 6))
+        ).pack(fill="x", padx=22, pady=(10, 3))
 
         self.instance_count_label = tk.Label(
             window,
@@ -4383,7 +4836,7 @@ class DesktopManager:
             font=("Microsoft YaHei UI", 9),
             anchor="w",
         )
-        self.instance_count_label.pack(fill="x", padx=22, pady=(0, 14))
+        self.instance_count_label.pack(fill="x", padx=22, pady=(0, 6))
 
         opacity_row = tk.Frame(window, bg=BG_BODY)
         opacity_row.pack(fill="x", padx=22)
@@ -4418,7 +4871,7 @@ class DesktopManager:
             bd=0,
             showvalue=False,
             length=326,
-        ).pack(fill="x", padx=20, pady=(2, 12))
+        ).pack(fill="x", padx=20, pady=(1, 5))
 
         tk.Checkbutton(
             window,
@@ -4432,7 +4885,7 @@ class DesktopManager:
             font=("Microsoft YaHei UI", 10),
             anchor="w",
             highlightthickness=0,
-        ).pack(fill="x", padx=18, pady=(0, 12))
+        ).pack(fill="x", padx=18, pady=(0, 4))
 
         tk.Checkbutton(
             window,
@@ -4446,7 +4899,7 @@ class DesktopManager:
             font=("Microsoft YaHei UI", 10),
             anchor="w",
             highlightthickness=0,
-        ).pack(fill="x", padx=18, pady=(0, 12))
+        ).pack(fill="x", padx=18, pady=(0, 4))
 
         tk.Checkbutton(
             window,
@@ -4461,7 +4914,7 @@ class DesktopManager:
             font=("Microsoft YaHei UI", 10),
             anchor="w",
             highlightthickness=0,
-        ).pack(fill="x", padx=18, pady=(0, 12))
+        ).pack(fill="x", padx=18, pady=(0, 4))
 
         tk.Checkbutton(
             window,
@@ -4476,7 +4929,50 @@ class DesktopManager:
             font=("Microsoft YaHei UI", 10),
             anchor="w",
             highlightthickness=0,
-        ).pack(fill="x", padx=18, pady=(0, 12))
+        ).pack(fill="x", padx=18, pady=(0, 4))
+
+        hotkey_row = tk.Frame(window, bg=BG_BODY)
+        hotkey_row.pack(fill="x", padx=22, pady=(0, 3))
+        tk.Label(
+            hotkey_row,
+            text="快捷隐藏快捷键",
+            bg=BG_BODY,
+            fg=TEXT,
+            font=("Microsoft YaHei UI", 10),
+        ).pack(side="left")
+        self.hide_hotkey_input = tk.StringVar(master=window, value=self.hide_hotkey)
+        hotkey_entry = tk.Entry(
+            hotkey_row,
+            textvariable=self.hide_hotkey_input,
+            width=15,
+            bg=BG_PANEL,
+            fg=TEXT,
+            insertbackground=TEXT,
+            relief="flat",
+            font=("Segoe UI", 10),
+        )
+        hotkey_entry.pack(side="left", padx=(10, 6), ipady=4)
+        hotkey_entry.bind("<Return>", lambda _event: self.apply_hide_hotkey())
+        tk.Button(
+            hotkey_row,
+            text="应用",
+            command=self.apply_hide_hotkey,
+            bg=BG_TITLE,
+            fg=ACCENT,
+            relief="flat",
+            bd=0,
+            cursor="hand2",
+        ).pack(side="right")
+        tk.Label(
+            window,
+            text="按一次全部隐藏，再按一次恢复；如 Ctrl+K、Ctrl+Shift+H。",
+            bg=BG_BODY,
+            fg=TEXT_MUTED,
+            font=("Microsoft YaHei UI", 8),
+            anchor="w",
+            justify="left",
+            wraplength=400,
+        ).pack(fill="x", padx=22, pady=(0, 5))
 
         margin_row = tk.Frame(window, bg=BG_BODY)
         margin_row.pack(fill="x", padx=22)
@@ -4519,7 +5015,7 @@ class DesktopManager:
             justify="left",
             wraplength=350,
         )
-        self.settings_note_label.pack(fill="x", padx=22, pady=(16, 12))
+        self.settings_note_label.pack(fill="x", padx=22, pady=(8, 8))
         self._update_settings_note()
 
         self.update_status_label = tk.Label(
@@ -4532,10 +5028,10 @@ class DesktopManager:
             justify="left",
             wraplength=350,
         )
-        self.update_status_label.pack(fill="x", padx=22, pady=(0, 12))
+        self.update_status_label.pack(fill="x", padx=22, pady=(0, 8))
 
         actions = tk.Frame(window, bg=BG_BODY)
-        actions.pack(fill="x", padx=22, pady=(0, 18))
+        actions.pack(fill="x", padx=22, pady=(0, 12))
         tk.Button(
             actions,
             text="恢复默认",
@@ -4584,7 +5080,7 @@ class DesktopManager:
         ).pack(side="right")
 
         settings_width = 450
-        settings_height = 590
+        settings_height = 650
         cursor = Point()
         user32.GetCursorPos(ctypes.byref(cursor))
         _monitor_area, work_area = _monitor_areas_at(cursor.x, cursor.y)
@@ -4626,6 +5122,26 @@ class DesktopManager:
     def _on_auto_update_changed(self) -> None:
         if self.auto_update.get():
             self.check_for_updates(manual=False)
+
+    def apply_hide_hotkey(self, binding: str | None = None) -> bool:
+        value = binding if binding is not None else self.hide_hotkey_input.get()
+        try:
+            canonical, _modifiers, _virtual_key = _parse_hide_hotkey(value)
+        except ValueError as error:
+            self._hide_hotkey_error = str(error)
+            self._update_settings_note()
+            return False
+        if not self.tray.set_hide_hotkey(canonical):
+            self._hide_hotkey_error = f"{canonical} 已被其他程序占用，请换一个组合键。"
+            self._update_settings_note()
+            return False
+        self.hide_hotkey = canonical
+        if hasattr(self, "hide_hotkey_input"):
+            self.hide_hotkey_input.set(canonical)
+        self._hide_hotkey_error = None
+        self._schedule_settings_save()
+        self._update_settings_note()
+        return True
 
     def _tray_check_updates(self) -> None:
         self.open_settings()
@@ -4719,6 +5235,8 @@ class DesktopManager:
             return
         if self._auto_start_error:
             message = self._auto_start_error
+        elif self._hide_hotkey_error:
+            message = self._hide_hotkey_error
         elif self._window_save_error:
             message = "窗口存档暂时无法写入磁盘；退出前会再次尝试。"
         elif self._settings_save_error:
@@ -4730,6 +5248,7 @@ class DesktopManager:
                 text=message,
                 fg=CLOSE_HOVER if (
                     self._auto_start_error
+                    or self._hide_hotkey_error
                     or self._window_save_error
                     or self._settings_save_error
                 ) else TEXT_MUTED,
@@ -4751,7 +5270,7 @@ class DesktopManager:
             self._save_settings_now,
         )
 
-    def _current_settings(self) -> dict[str, int | bool]:
+    def _current_settings(self) -> dict[str, int | bool | str]:
         try:
             opacity = int(self.opacity_percent.get())
         except (tk.TclError, ValueError):
@@ -4778,6 +5297,7 @@ class DesktopManager:
             "restore_margin": _clamp(restore_margin, 0, 80),
             "no_background": no_background,
             "auto_update": auto_update,
+            "hide_hotkey": self.hide_hotkey,
         }
 
     def _save_settings_now(self) -> None:
@@ -4807,6 +5327,7 @@ class DesktopManager:
         self.restore_margin.set(RESTORE_MARGIN)
         self.no_background.set(False)
         self.auto_update.set(False)
+        self.apply_hide_hotkey(str(SettingsStore.DEFAULTS["hide_hotkey"]))
         if self.auto_start.get():
             self.auto_start.set(False)
             self._on_auto_start_changed()
@@ -4858,6 +5379,9 @@ class DesktopManager:
             window.on_state_change = None
             window.close()
         self.windows.clear()
+        if self._browser_session is not None:
+            self._browser_session.close()
+            self._browser_session = None
         self.tray.cleanup()
         try:
             self.root.destroy()
@@ -4921,7 +5445,33 @@ def _self_test() -> None:
     app = OverlayApp(visible=False)
     app.root.update()
     assert _position_from_arguments(["--position", "-120", "80"]) == (-120, 80)
+    assert _browser_destination("example.com/docs") == "https://example.com/docs"
+    assert _parse_hide_hotkey("ctrl+k") == ("Ctrl+K", MOD_CONTROL, ord("K"))
+    assert _parse_hide_hotkey("shift + ctrl + f12") == (
+        "Ctrl+Shift+F12", MOD_CONTROL | MOD_SHIFT, 0x7B
+    )
+    for invalid_hotkey in ("K", "Shift+K", "Ctrl+Alt+D", "Ctrl+K+K"):
+        try:
+            _parse_hide_hotkey(invalid_hotkey)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"unsafe hide hotkey was accepted: {invalid_hotkey}")
+    assert _browser_destination("localhost:8000") == "http://localhost:8000"
+    assert _browser_destination("找资料") == "https://www.bing.com/search?q=%E6%89%BE%E8%B5%84%E6%96%99"
+    try:
+        _browser_destination("javascript:alert(1)")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("unsafe browser URL was accepted")
     assert app.mode == "便签"
+    app.set_mode("浏览器")
+    app.browser_address.set("example.com/docs")
+    app._browser_navigate()
+    assert app.state_snapshot()["browser_url"] == "https://example.com/docs"
+    assert app._browser_web is None, "hidden self-test opened a browser"
+    app.set_mode("便签")
     app.note_text.insert("1.0", "临时想法")
     app.mode_menu.invoke(1)
     assert app.mode == "待办", "mode menu did not switch the window purpose"
@@ -5295,6 +5845,46 @@ def _self_test() -> None:
     visible_lock_app.set_locked(False)
     visible_lock_app.root.update()
     assert visible_lock_app.root.state() == "normal"
+
+    try:
+        from tkwry import WebView as _BrowserProbeDependency
+    except ImportError:
+        pass
+    else:
+        del _BrowserProbeDependency
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as browser_temp:
+            browser_probe = OverlayApp(
+                visible=True,
+                master=visible_lock_app.root,
+                browser_data_dir=Path(browser_temp) / "profile",
+            )
+            browser_probe.set_mode("浏览器")
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not (
+                browser_probe._browser_web is not None
+                and browser_probe._browser_web.ready
+            ):
+                browser_probe.root.update()
+                time.sleep(0.02)
+            assert browser_probe._browser_web is not None and browser_probe._browser_web.ready, (
+                browser_probe.browser_error_label.cget("text")
+            )
+            browser_probe.set_locked(True)
+            browser_probe.root.update()
+            assert not browser_probe.browser_host.winfo_ismapped()
+            assert browser_probe.click_through_style_is_set()
+            browser_probe.set_locked(False)
+            browser_probe.root.update()
+            assert browser_probe.browser_host.winfo_ismapped()
+            browser_probe.set_overlay_visible(False)
+            browser_probe.root.update()
+            assert browser_probe.root.state() == "withdrawn"
+            browser_probe.set_overlay_visible(True)
+            browser_probe.root.update()
+            assert browser_probe.browser_host.winfo_ismapped()
+            assert browser_probe._browser_web.ready
+            browser_probe.close()
+            visible_lock_app.root.update()
     visible_lock_app.close()
 
     temporary_settings_directory = tempfile.TemporaryDirectory()
@@ -5320,7 +5910,7 @@ def _self_test() -> None:
         directory=Path(temporary_settings_directory.name) / "updates",
         opener=fake_release_opener,
     )
-    assert _version_numbers("2.1.3") > _version_numbers(APP_VERSION)
+    assert _version_numbers("2.2.3") > _version_numbers(APP_VERSION)
     assert release_client.latest() == fake_manifest
     staged_test_package = release_client.download(fake_manifest)
     assert staged_test_package.read_bytes() == fake_package
@@ -5375,6 +5965,7 @@ def _self_test() -> None:
     try:
         user32.AppendMenuW(test_menu, MF_STRING, TRAY_COMMAND_ADD, "添加自由窗口")
         user32.AppendMenuW(test_menu, MF_STRING, TRAY_COMMAND_CAPTURE, "快速收集")
+        user32.AppendMenuW(test_menu, MF_STRING, TRAY_COMMAND_VISIBILITY, "隐藏/显示全部窗口")
         user32.AppendMenuW(test_menu, MF_STRING, TRAY_COMMAND_SETTINGS, "设置")
         user32.AppendMenuW(test_menu, MF_STRING, TRAY_COMMAND_UPDATE, "检查更新")
         user32.AppendMenuW(test_menu, MF_STRING, TRAY_COMMAND_EXIT, "退出")
@@ -5507,7 +6098,7 @@ def _self_test() -> None:
     assert manager.settings_window.winfo_reqwidth() <= 450, (
         manager.settings_window.winfo_reqwidth()
     )
-    assert manager.settings_window.winfo_reqheight() <= 590, (
+    assert manager.settings_window.winfo_reqheight() <= 650, (
         f"settings controls do not fit: {manager.settings_window.winfo_reqheight()}"
     )
     assert manager.update_button.cget("text") == "检查更新"
@@ -5863,18 +6454,133 @@ def _self_test() -> None:
         if window.mode == "便签"
     ).note_text.get("1.0", "end-1c") == "第一段便签\n\n第二段便签"
     capture_reopened.exit_app()
+
+    hide_settings_path = (
+        Path(temporary_settings_directory.name) / "Hide" / "settings.json"
+    )
+    hide_manager = DesktopManager(
+        tray_enabled=False,
+        visible=True,
+        create_initial_window=False,
+        settings_path=hide_settings_path,
+        auto_start_store=MemoryAutoStartStore(),
+        update_client=current_client,
+    )
+    normal_window = hide_manager.add_window()
+    locked_window = hide_manager.add_window()
+    locked_window.set_locked(True)
+    ball_window = hide_manager.add_window()
+    ball_window.set_mode("快捷按键")
+    _, hide_work_area = _monitor_areas_at(
+        ball_window.root.winfo_x(), ball_window.root.winfo_y()
+    )
+    hide_ball_target, hide_ball_edge = ball_window._ball_target_at_edge(
+        hide_work_area[2] - 1, hide_work_area[1] + 130
+    )
+    ball_window._collapse_to_ball(hide_ball_target, hide_ball_edge)
+    deadline = time.monotonic() + 2
+    while ball_window.animating and time.monotonic() < deadline:
+        hide_manager.root.update()
+        time.sleep(0.01)
+    assert ball_window.collapsed
+    hide_manager.open_settings()
+    hide_manager.open_quick_capture(prefill_clipboard=False)
+    hide_manager.root.update()
+    assert normal_window.root.state() == "normal"
+    assert locked_window.lock_window.state() == "normal"
+    assert ball_window.ball_window.state() == "normal"
+    assert ball_window.shortcut_window.state() == "normal"
+    states_before_hide = {
+        overlay.instance_number: overlay.state_snapshot()
+        for overlay in (normal_window, locked_window, ball_window)
+    }
+    hide_manager.toggle_overlays_hidden()
+    hide_manager.root.update()
+    assert hide_manager.overlays_hidden
+    for overlay in (normal_window, locked_window, ball_window):
+        assert not overlay.visible
+        for surface in (
+            overlay.root, overlay.ball_window, overlay.lock_window,
+            overlay.shortcut_window,
+        ):
+            assert surface.state() == "withdrawn"
+    assert hide_manager.settings_window.state() == "withdrawn"
+    assert hide_manager.quick_capture_window.state() == "withdrawn"
+    assert locked_window.locked and ball_window.collapsed
+    # Simulate WM_HOTKEY through the same tray message route as a real keypress.
+    hide_manager.tray._hide_hotkey_id = HIDE_HOTKEY_IDS[0]
+    hide_manager.tray._window_proc(
+        hide_manager.tray.hwnd, WM_HOTKEY, HIDE_HOTKEY_IDS[0], 0
+    )
+    hide_manager.tray._hide_hotkey_id = None
+    deadline = time.monotonic() + 1
+    while hide_manager.overlays_hidden and time.monotonic() < deadline:
+        hide_manager.root.update()
+        time.sleep(0.01)
+    assert not hide_manager.overlays_hidden
+    assert normal_window.root.state() == "normal"
+    assert locked_window.root.state() == "normal"
+    assert locked_window.lock_window.state() == "normal"
+    assert locked_window.locked and locked_window.click_through_style_is_set()
+    assert ball_window.ball_window.state() == "normal"
+    assert ball_window.shortcut_window.state() == "normal"
+    assert ball_window.collapsed
+    assert {
+        overlay.instance_number: overlay.state_snapshot()
+        for overlay in (normal_window, locked_window, ball_window)
+    } == states_before_hide
+    assert hide_manager.settings_window.state() == "normal"
+    assert hide_manager.quick_capture_window.state() == "normal"
+    assert hide_manager.hide_hotkey == "Ctrl+K"
+    hide_manager.hide_hotkey_input.set("shift + ctrl + f12")
+    assert hide_manager.apply_hide_hotkey()
+    assert hide_manager.hide_hotkey == "Ctrl+Shift+F12"
+    assert not hide_manager.apply_hide_hotkey("Ctrl+Alt+D")
+    assert hide_manager.hide_hotkey == "Ctrl+Shift+F12"
+    hide_manager._save_settings_now()
+    assert json.loads(hide_settings_path.read_text(encoding="utf-8"))[
+        "hide_hotkey"
+    ] == "Ctrl+Shift+F12"
+    hide_manager.tray.dispatch_command_for_test(TRAY_COMMAND_VISIBILITY)
+    deadline = time.monotonic() + 1
+    while not hide_manager.overlays_hidden and time.monotonic() < deadline:
+        hide_manager.root.update()
+        time.sleep(0.01)
+    assert hide_manager.overlays_hidden
+    hidden_new_window = hide_manager.add_window()
+    assert hidden_new_window.root.state() == "withdrawn"
+    hidden_new_window.close()
+    hide_manager.tray.dispatch_command_for_test(TRAY_COMMAND_VISIBILITY)
+    deadline = time.monotonic() + 1
+    while hide_manager.overlays_hidden and time.monotonic() < deadline:
+        hide_manager.root.update()
+        time.sleep(0.01)
+    assert not hide_manager.overlays_hidden
+    assert hidden_new_window not in hide_manager.windows
+    hide_manager.exit_app()
+    reloaded_hide_manager = DesktopManager(
+        tray_enabled=False,
+        visible=False,
+        create_initial_window=False,
+        settings_path=hide_settings_path,
+        auto_start_store=MemoryAutoStartStore(),
+        update_client=current_client,
+    )
+    assert reloaded_hide_manager.hide_hotkey == "Ctrl+Shift+F12"
+    reloaded_hide_manager.exit_app()
     temporary_settings_directory.cleanup()
     print(
         "Self-test passed: tray manager and icons, persistent settings and windows, "
         "per-user auto-start option, "
         "verified GitHub update index and persistent auto-update option, "
         "independent window/task ids, shared task views and legacy migration, "
-        "six window modes with persistent task focus and a cycling window switcher, "
+        "seven window modes including a per-window browser, persistent task focus and a cycling window switcher, "
         "editable and removable todos, "
         "quick capture to existing or new windows, "
         "empty-note placeholder, "
         "no-background mode, persistent content-visible click-through lock, "
         "background lifetime, "
+        "global hide hotkey restores normal, locked and collapsed windows, "
         "and ball collapse/restore work correctly."
     )
 

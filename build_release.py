@@ -45,6 +45,8 @@ def main() -> None:
             "--clean",
             "--onefile",
             "--windowed",
+            "--collect-submodules",
+            "tkwry",
             "--name",
             "DesktopTools",
             "--distpath",
