@@ -28,7 +28,7 @@ from queue import Empty, Queue
 
 
 APP_TITLE = "DesktopTools 自由窗口"
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.2.1"
 UPDATE_MANIFEST_URL = (
     "https://raw.githubusercontent.com/FennecMomo/DesktopTools/"
     "main/dist/update.json"
@@ -38,6 +38,8 @@ UPDATE_PACKAGE_URL = (
     "main/dist/DesktopTools.exe"
 )
 MAX_UPDATE_BYTES = 100 * 1024 * 1024
+SINGLE_INSTANCE_MUTEX_NAME = "Local\\FennecMomo.DesktopTools.Singleton.v1"
+SECOND_INSTANCE_MESSAGE_NAME = "FennecMomo.DesktopTools.SecondInstance.v1"
 
 WINDOW_WIDTH = 560
 WINDOW_HEIGHT = 320
@@ -108,6 +110,8 @@ WM_LBUTTONDBLCLK = 0x0203
 WM_RBUTTONUP = 0x0205
 WM_HOTKEY = 0x0312
 WM_APP = 0x8000
+HWND_BROADCAST = 0xFFFF
+ERROR_ALREADY_EXISTS = 183
 TRAY_CALLBACK_MESSAGE = WM_APP + 20
 QUICK_CAPTURE_HOTKEY_ID = 1
 HIDE_HOTKEY_IDS = (2, 3)
@@ -437,6 +441,16 @@ kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
 kernel32.GetModuleHandleW.restype = wintypes.HINSTANCE
 kernel32.GetCurrentProcessId.argtypes = []
 kernel32.GetCurrentProcessId.restype = wintypes.DWORD
+kernel32.CreateMutexW.argtypes = [
+    wintypes.LPVOID,
+    wintypes.BOOL,
+    wintypes.LPCWSTR,
+]
+kernel32.CreateMutexW.restype = wintypes.HANDLE
+kernel32.ReleaseMutex.argtypes = [wintypes.HANDLE]
+kernel32.ReleaseMutex.restype = wintypes.BOOL
+kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+kernel32.CloseHandle.restype = wintypes.BOOL
 shell32.Shell_NotifyIconW.argtypes = [
     wintypes.DWORD,
     ctypes.POINTER(NotifyIconData),
@@ -708,6 +722,45 @@ def _parse_hide_hotkey(value: str) -> tuple[str, int, int]:
         raise ValueError("Ctrl+Alt+D 已用于快速收集")
     label = "+".join(names[name][0] for name in ("ctrl", "alt", "shift") if name in seen)
     return f"{label}+{key_name}", modifiers, virtual_key
+
+
+class SingleInstanceGuard:
+    """Own a named Windows mutex for the lifetime of the main app process."""
+
+    def __init__(self, name: str = SINGLE_INSTANCE_MUTEX_NAME) -> None:
+        self.name = name
+        self._handle: int | None = None
+
+    @property
+    def acquired(self) -> bool:
+        return self._handle is not None
+
+    def acquire(self) -> bool:
+        if self._handle is not None:
+            return True
+        ctypes.set_last_error(0)
+        handle = kernel32.CreateMutexW(None, True, self.name)
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+            kernel32.CloseHandle(handle)
+            return False
+        self._handle = handle
+        return True
+
+    def close(self) -> None:
+        if self._handle is None:
+            return
+        kernel32.ReleaseMutex(self._handle)
+        kernel32.CloseHandle(self._handle)
+        self._handle = None
+
+
+def _signal_existing_instance() -> bool:
+    message = user32.RegisterWindowMessageW(SECOND_INSTANCE_MESSAGE_NAME)
+    return bool(
+        message and user32.PostMessageW(HWND_BROADCAST, message, 0, 0)
+    )
 
 
 class SettingsStore:
@@ -1400,6 +1453,7 @@ class SystemTrayIcon:
         on_update: Callable[[], None],
         on_capture: Callable[[], None],
         on_toggle_visibility: Callable[[], None],
+        on_second_launch: Callable[[], None],
         on_exit: Callable[[], None],
         hide_hotkey: str,
         show_icon: bool = True,
@@ -1410,6 +1464,7 @@ class SystemTrayIcon:
         self.on_update = on_update
         self.on_capture = on_capture
         self.on_toggle_visibility = on_toggle_visibility
+        self.on_second_launch = on_second_launch
         self.on_exit = on_exit
         self.show_icon = show_icon
         self._cleaned = False
@@ -1425,6 +1480,9 @@ class SystemTrayIcon:
         self._window_proc_callback = WindowProcedure(self._window_proc)
         self._taskbar_created_message = user32.RegisterWindowMessageW(
             "TaskbarCreated"
+        )
+        self._second_instance_message = user32.RegisterWindowMessageW(
+            SECOND_INSTANCE_MESSAGE_NAME
         )
 
         icon_resource = ctypes.cast(
@@ -1565,6 +1623,9 @@ class SystemTrayIcon:
             return 0
         if message == WM_HOTKEY and int(w_param) == self._hide_hotkey_id:
             self._schedule(self.on_toggle_visibility)
+            return 0
+        if message == self._second_instance_message:
+            self._schedule(self.on_second_launch)
             return 0
 
         if message == WM_DESTROY:
@@ -4336,6 +4397,7 @@ class DesktopManager:
             on_update=self._tray_check_updates,
             on_capture=self.open_quick_capture,
             on_toggle_visibility=self.toggle_overlays_hidden,
+            on_second_launch=self._handle_second_launch,
             on_exit=self.exit_app,
             hide_hotkey=self.hide_hotkey,
             show_icon=tray_enabled,
@@ -4360,6 +4422,34 @@ class DesktopManager:
         self._hover_after_id = self.root.after(HOVER_POLL_MS, self._poll_hover)
         if self.auto_update.get() and getattr(sys, "frozen", False):
             self.root.after(1500, lambda: self.check_for_updates(manual=False))
+
+    def _handle_second_launch(self) -> None:
+        if self._exiting:
+            return
+        restored_hidden_windows = self.overlays_hidden
+        if self.overlays_hidden:
+            self.toggle_overlays_hidden()
+        if not self.windows:
+            target = self.add_window()
+        else:
+            target = self.windows[-1]
+            target.set_overlay_visible(self.visible)
+        if self.visible:
+            surface = target.ball_window if target.collapsed else target.root
+            try:
+                surface.deiconify()
+                surface.attributes("-topmost", True)
+                surface.lift()
+                if not target.collapsed and not target.locked:
+                    surface.focus_force()
+            except tk.TclError:
+                pass
+        message = (
+            "已恢复原有窗口，不会启动第二个后台实例。"
+            if restored_hidden_windows else
+            "已切换到正在运行的实例，不会重复启动。"
+        )
+        self.tray.notify("DesktopTools 已在运行", message)
 
     def toggle_overlays_hidden(self) -> None:
         if self._exiting:
@@ -5410,6 +5500,19 @@ class DesktopManager:
 
 
 def _self_test() -> None:
+    mutex_name = (
+        f"Local\\FennecMomo.DesktopTools.SelfTest."
+        f"{kernel32.GetCurrentProcessId()}.{time.time_ns()}"
+    )
+    first_guard = SingleInstanceGuard(mutex_name)
+    second_guard = SingleInstanceGuard(mutex_name)
+    assert first_guard.acquire(), "first process could not acquire instance mutex"
+    assert not second_guard.acquire(), "duplicate process acquired instance mutex"
+    first_guard.close()
+    replacement_guard = SingleInstanceGuard(mutex_name)
+    assert replacement_guard.acquire(), "instance mutex was not released on exit"
+    replacement_guard.close()
+
     class MemoryAutoStartStore(AutoStartStore):
         def __init__(self) -> None:
             self.saved_command: str | None = None
@@ -5985,6 +6088,17 @@ def _self_test() -> None:
         manager.root.update()
         time.sleep(0.01)
     assert len(manager.windows) == 2, "manager did not create two instances"
+    manager.tray._window_proc(
+        manager.tray.hwnd,
+        manager.tray._second_instance_message,
+        0,
+        0,
+    )
+    deadline = time.monotonic() + 1
+    while manager.tray._pending_actions and time.monotonic() < deadline:
+        manager.root.update()
+        time.sleep(0.01)
+    assert len(manager.windows) == 2, "second launch created duplicate windows"
     first_window, second_window = manager.windows
     first_window.note_text.insert("1.0", "第一扇便签")
     first_window.set_mode("待办")
@@ -6531,6 +6645,19 @@ def _self_test() -> None:
     } == states_before_hide
     assert hide_manager.settings_window.state() == "normal"
     assert hide_manager.quick_capture_window.state() == "normal"
+    hide_manager.toggle_overlays_hidden()
+    hide_manager.tray._window_proc(
+        hide_manager.tray.hwnd,
+        hide_manager.tray._second_instance_message,
+        0,
+        0,
+    )
+    deadline = time.monotonic() + 1
+    while hide_manager.overlays_hidden and time.monotonic() < deadline:
+        hide_manager.root.update()
+        time.sleep(0.01)
+    assert not hide_manager.overlays_hidden, "second launch did not restore hidden windows"
+    assert len(hide_manager.windows) == 3, "second launch duplicated windows"
     assert hide_manager.hide_hotkey == "Ctrl+K"
     hide_manager.hide_hotkey_input.set("shift + ctrl + f12")
     assert hide_manager.apply_hide_hotkey()
@@ -6579,7 +6706,7 @@ def _self_test() -> None:
         "quick capture to existing or new windows, "
         "empty-note placeholder, "
         "no-background mode, persistent content-visible click-through lock, "
-        "background lifetime, "
+        "background lifetime and single-instance activation, "
         "global hide hotkey restores normal, locked and collapsed windows, "
         "and ball collapse/restore work correctly."
     )
@@ -6602,6 +6729,13 @@ if __name__ == "__main__":
     elif "--self-test" in sys.argv:
         _self_test()
     else:
-        DesktopManager(
-            initial_position=_position_from_arguments(sys.argv[1:])
-        ).run()
+        instance_guard = SingleInstanceGuard()
+        if not instance_guard.acquire():
+            _signal_existing_instance()
+            sys.exit(0)
+        try:
+            DesktopManager(
+                initial_position=_position_from_arguments(sys.argv[1:])
+            ).run()
+        finally:
+            instance_guard.close()
