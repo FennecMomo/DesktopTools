@@ -15,7 +15,6 @@ import threading
 import time
 import tkinter as tk
 import tkinter.messagebox as messagebox
-import tkinter.simpledialog as simpledialog
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -28,7 +27,7 @@ from queue import Empty, Queue
 
 
 APP_TITLE = "DesktopTools 自由窗口"
-APP_VERSION = "2.2.1"
+APP_VERSION = "2.3.0"
 UPDATE_MANIFEST_URL = (
     "https://raw.githubusercontent.com/FennecMomo/DesktopTools/"
     "main/dist/update.json"
@@ -859,7 +858,7 @@ class TaskState:
     def __init__(self, task_id: int) -> None:
         self.id = task_id
         self.note = ""
-        self.todos: list[tuple[str, bool]] = []
+        self.todos: list[tuple[str, bool, float | None, float | None]] = []
         self.focus_task_index: int | None = None
         self.focus_status = "ready"
         self.focus_remaining_seconds: float = 25 * 60
@@ -876,7 +875,18 @@ class TaskState:
         raw_todos = record.get("todos")
         if isinstance(raw_todos, list):
             task.todos = [
-                (item["text"], item["done"])
+                (
+                    item["text"],
+                    item["done"],
+                    item.get("due")
+                    if type(item.get("due")) in (int, float)
+                    and math.isfinite(item.get("due"))
+                    else None,
+                    item.get("created")
+                    if type(item.get("created")) in (int, float)
+                    and math.isfinite(item.get("created"))
+                    else None,
+                )
                 for item in raw_todos
                 if isinstance(item, dict)
                 and isinstance(item.get("text"), str)
@@ -904,7 +914,13 @@ class TaskState:
             "id": self.id,
             "note": self.note,
             "todos": [
-                {"text": title, "done": done} for title, done in self.todos
+                {
+                    "text": title,
+                    "done": done,
+                    "due": due,
+                    "created": created,
+                }
+                for title, done, due, created in self.todos
             ],
             "focus_task_index": self.focus_task_index,
             "focus_status": self.focus_status,
@@ -916,6 +932,399 @@ class TaskState:
             "timer_minutes": self.timer_minutes,
             "timer_status": self.timer_status,
         }
+
+
+FOCUS_STATUS_TEXT = {
+    "running": "运行中",
+    "paused": "已暂停",
+    "finished": "已完成",
+    "ready": "待开始",
+}
+TIMER_STATUS_TEXT = {
+    "running": "运行中",
+    "paused": "已暂停",
+    "finished": "已结束",
+    "ready": "未开始",
+}
+DUE_OVERDUE = "#FF6B6B"
+
+
+def _format_due_timestamp(value: float) -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(value))
+
+
+def _todo_display_text(item: tuple[str, bool, float | None, float | None]) -> str:
+    title, done, due, _created = item
+    text = f"{'☑' if done else '☐'}  {title}"
+    if due is not None:
+        text += f"　⏰ {time.strftime('%m-%d %H:%M:%S', time.localtime(due))}"
+    return text
+
+
+def _due_epoch_from_fields(
+    year: int,
+    month: int,
+    day: int,
+    hour: int,
+    minute: int,
+    second: int,
+) -> float:
+    try:
+        stamp = time.mktime((year, month, day, hour, minute, second, 0, 0, -1))
+    except (OverflowError, ValueError) as error:
+        raise ValueError("日期或时间无效") from error
+    if time.localtime(stamp)[:6] != (year, month, day, hour, minute, second):
+        raise ValueError("日期或时间无效")
+    return stamp
+
+
+def _task_content_summary(task: TaskState) -> str:
+    parts: list[str] = []
+    note_characters = len("".join(task.note.split()))
+    if note_characters:
+        parts.append(f"便签 {note_characters} 字")
+    done_count = sum(1 for item in task.todos if item[1])
+    if task.todos:
+        if done_count:
+            parts.append(f"待办 {len(task.todos)} 项（{done_count} 项完成）")
+        else:
+            parts.append(f"待办 {len(task.todos)} 项")
+    focus_index = task.focus_task_index
+    if focus_index is not None and 0 <= focus_index < len(task.todos):
+        title = task.todos[focus_index][0]
+        short_title = title[:16] + ("…" if len(title) > 16 else "")
+        focus_status = FOCUS_STATUS_TEXT.get(task.focus_status, task.focus_status)
+        parts.append(f"任务胶囊：{short_title}（{focus_status}）")
+    if task.timer_status != "ready":
+        timer_status = TIMER_STATUS_TEXT.get(task.timer_status, task.timer_status)
+        parts.append(f"倒计时 {task.timer_minutes} 分（{timer_status}）")
+    return " · ".join(parts)
+
+
+def _prompt_task_binding(
+    parent: tk.Misc,
+    current_task_id: int,
+    tasks: list[TaskState],
+) -> int | None:
+    window = tk.Toplevel(parent)
+    window.withdraw()
+    window.title("绑定任务编号")
+    window.configure(bg=BG_BODY)
+    window.resizable(False, False)
+    window.transient(parent.winfo_toplevel())
+    window.attributes("-topmost", True)
+
+    result: list[int | None] = [None]
+
+    tk.Label(
+        window,
+        text="绑定任务编号",
+        bg=BG_BODY,
+        fg=TEXT,
+        font=("Microsoft YaHei UI", 12, "bold"),
+        anchor="w",
+    ).pack(fill="x", padx=18, pady=(14, 2))
+
+    tk.Label(
+        window,
+        text="已有任务的内容一览；选中一行可填入编号，输入新编号会新建任务。",
+        bg=BG_BODY,
+        fg=TEXT_MUTED,
+        font=("Microsoft YaHei UI", 9),
+        anchor="w",
+    ).pack(fill="x", padx=18, pady=(0, 6))
+
+    list_row = tk.Frame(window, bg=BG_BODY)
+    list_row.pack(fill="both", expand=True, padx=18)
+    list_height = _clamp(len(tasks), 1, 10)
+    task_list = tk.Listbox(
+        list_row,
+        bg=BG_PANEL,
+        fg=TEXT,
+        selectbackground="#3B6557",
+        selectforeground=TEXT,
+        activestyle="none",
+        relief="flat",
+        bd=0,
+        highlightthickness=0,
+        font=("Microsoft YaHei UI", 9),
+        height=list_height,
+        width=58,
+        exportselection=False,
+    )
+    task_list.pack(side="left", fill="both", expand=True)
+    if len(tasks) > list_height:
+        scrollbar = tk.Scrollbar(
+            list_row,
+            command=task_list.yview,
+            bg=BG_BODY,
+            troughcolor=BG_PANEL,
+            activebackground=BG_TITLE,
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+        )
+        scrollbar.pack(side="right", fill="y")
+        task_list.configure(yscrollcommand=scrollbar.set)
+    task_ids = [task.id for task in tasks]
+    if tasks:
+        for index, task in enumerate(tasks):
+            summary = _task_content_summary(task)
+            line = f"#{task.id} {'●' if summary else '○'} {summary or '暂无内容'}"
+            if task.id == current_task_id:
+                line += "　← 当前窗口"
+            task_list.insert("end", line)
+            if task.id == current_task_id:
+                task_list.itemconfig(index, fg=ACCENT)
+            elif not summary:
+                task_list.itemconfig(index, fg=TEXT_MUTED)
+    else:
+        task_list.insert("end", "还没有任务；直接输入编号即可新建。")
+        task_list.itemconfig(0, fg=TEXT_MUTED)
+
+    entry_row = tk.Frame(window, bg=BG_BODY)
+    entry_row.pack(fill="x", padx=18, pady=(10, 2))
+    tk.Label(
+        entry_row,
+        text="任务编号",
+        bg=BG_BODY,
+        fg=TEXT,
+        font=("Microsoft YaHei UI", 10),
+    ).pack(side="left")
+    entry_value = tk.StringVar(master=window, value=str(current_task_id))
+    entry = tk.Entry(
+        entry_row,
+        textvariable=entry_value,
+        width=14,
+        bg=BG_PANEL,
+        fg=TEXT,
+        insertbackground=TEXT,
+        relief="flat",
+        font=("Segoe UI", 10),
+    )
+    entry.pack(side="left", padx=(10, 0), ipady=4)
+
+    status_label = tk.Label(
+        window,
+        text="已有任务会共享便签、待办和计时；不存在的编号会新建任务。",
+        bg=BG_BODY,
+        fg=TEXT_MUTED,
+        font=("Microsoft YaHei UI", 8),
+        anchor="w",
+    )
+    status_label.pack(fill="x", padx=18, pady=(0, 6))
+
+    def submit(_event: tk.Event | None = None) -> None:
+        value = entry_value.get().strip()
+        if not value.isdigit() or int(value) < 1:
+            status_label.configure(text="请输入大于 0 的整数编号。", fg=CLOSE_HOVER)
+            return
+        result[0] = int(value)
+        window.destroy()
+
+    def fill_from_selection(_event: tk.Event | None = None) -> None:
+        selection = task_list.curselection()
+        if selection:
+            entry_value.set(str(task_ids[selection[0]]))
+
+    task_list.bind("<<ListboxSelect>>", fill_from_selection)
+    task_list.bind("<Double-Button-1>", fill_from_selection)
+    entry.bind("<Return>", submit)
+
+    button_row = tk.Frame(window, bg=BG_BODY)
+    button_row.pack(fill="x", padx=18, pady=(0, 14))
+    tk.Button(
+        button_row,
+        text="取消",
+        command=window.destroy,
+        bg=BG_PANEL,
+        fg=TEXT_MUTED,
+        relief="flat",
+        bd=0,
+        padx=14,
+        cursor="hand2",
+    ).pack(side="right")
+    tk.Button(
+        button_row,
+        text="绑定",
+        command=submit,
+        bg=BG_TITLE,
+        fg=ACCENT,
+        relief="flat",
+        bd=0,
+        padx=14,
+        cursor="hand2",
+    ).pack(side="right", padx=(0, 8))
+
+    window.protocol("WM_DELETE_WINDOW", window.destroy)
+    window.bind("<Escape>", lambda _event: window.destroy())
+    window.update_idletasks()
+    top = parent.winfo_toplevel()
+    x = top.winfo_rootx() + (top.winfo_width() - window.winfo_reqwidth()) // 2
+    y = top.winfo_rooty() + (top.winfo_height() - window.winfo_reqheight()) // 2
+    x = _clamp(x, 0, max(0, window.winfo_screenwidth() - window.winfo_reqwidth()))
+    y = _clamp(y, 0, max(0, window.winfo_screenheight() - window.winfo_reqheight()))
+    window.geometry(f"+{x}+{y}")
+    window.deiconify()
+    window.grab_set()
+    entry.focus_set()
+    entry.selection_range(0, "end")
+    parent.wait_window(window)
+    return result[0]
+
+
+def _prompt_todo_due(
+    parent: tk.Misc,
+    todo_title: str,
+    initial_epoch: float | None,
+) -> tuple[bool, float | None]:
+    initial = time.localtime(
+        initial_epoch if initial_epoch is not None else time.time()
+    )
+    window = tk.Toplevel(parent)
+    window.withdraw()
+    window.title("设置截止时间")
+    window.configure(bg=BG_BODY)
+    window.resizable(False, False)
+    window.transient(parent.winfo_toplevel())
+    window.attributes("-topmost", True)
+
+    result: list[tuple[bool, float | None]] = [(False, None)]
+
+    tk.Label(
+        window,
+        text="设置截止时间",
+        bg=BG_BODY,
+        fg=TEXT,
+        font=("Microsoft YaHei UI", 12, "bold"),
+        anchor="w",
+    ).pack(fill="x", padx=18, pady=(14, 2))
+
+    short_title = todo_title[:40] + ("…" if len(todo_title) > 40 else "")
+    tk.Label(
+        window,
+        text=f"待办：{short_title}",
+        bg=BG_BODY,
+        fg=TEXT_MUTED,
+        font=("Microsoft YaHei UI", 9),
+        anchor="w",
+    ).pack(fill="x", padx=18, pady=(0, 8))
+
+    fields_row = tk.Frame(window, bg=BG_BODY)
+    fields_row.pack(fill="x", padx=18)
+    specs = (
+        ("year", 2000, 2099, 5),
+        ("month", 1, 12, 3),
+        ("day", 1, 31, 3),
+        ("hour", 0, 23, 3),
+        ("minute", 0, 59, 3),
+        ("second", 0, 59, 3),
+    )
+    units = ("年", "月", "日", "时", "分", "秒")
+    variables: dict[str, tk.IntVar] = {}
+    for index, (name, minimum, maximum, width) in enumerate(specs):
+        variable = tk.IntVar(master=window, value=initial[index])
+        variables[name] = variable
+        tk.Spinbox(
+            fields_row,
+            from_=minimum,
+            to=maximum,
+            textvariable=variable,
+            width=width,
+            justify="center",
+            bg=BG_PANEL,
+            fg=TEXT,
+            buttonbackground=BG_TITLE,
+            insertbackground=TEXT,
+            relief="flat",
+            font=("Segoe UI", 10),
+        ).pack(side="left", padx=(0, 4))
+        tk.Label(
+            fields_row,
+            text=units[index],
+            bg=BG_BODY,
+            fg=TEXT_MUTED,
+            font=("Microsoft YaHei UI", 9),
+        ).pack(side="left", padx=(0, 8))
+
+    status_label = tk.Label(
+        window,
+        text="截止时间到时只提醒一次，并把该事项标红，直到完成或改期。",
+        bg=BG_BODY,
+        fg=TEXT_MUTED,
+        font=("Microsoft YaHei UI", 8),
+        anchor="w",
+    )
+    status_label.pack(fill="x", padx=18, pady=(8, 6))
+
+    def submit(_event: tk.Event | None = None) -> None:
+        try:
+            values = tuple(int(variables[name].get()) for name, *_rest in specs)
+        except (tk.TclError, ValueError):
+            status_label.configure(text="请输入有效的年月日时分秒。", fg=CLOSE_HOVER)
+            return
+        try:
+            stamp = _due_epoch_from_fields(*values)
+        except ValueError as error:
+            status_label.configure(text=str(error), fg=CLOSE_HOVER)
+            return
+        result[0] = (True, stamp)
+        window.destroy()
+
+    def clear(_event: tk.Event | None = None) -> None:
+        result[0] = (True, None)
+        window.destroy()
+
+    button_row = tk.Frame(window, bg=BG_BODY)
+    button_row.pack(fill="x", padx=18, pady=(0, 14))
+    tk.Button(
+        button_row,
+        text="取消",
+        command=window.destroy,
+        bg=BG_PANEL,
+        fg=TEXT_MUTED,
+        relief="flat",
+        bd=0,
+        padx=14,
+        cursor="hand2",
+    ).pack(side="right")
+    tk.Button(
+        button_row,
+        text="清除截止",
+        command=clear,
+        bg=BG_PANEL,
+        fg=TEXT_MUTED,
+        relief="flat",
+        bd=0,
+        padx=14,
+        cursor="hand2",
+    ).pack(side="right", padx=(0, 8))
+    tk.Button(
+        button_row,
+        text="确定",
+        command=submit,
+        bg=BG_TITLE,
+        fg=ACCENT,
+        relief="flat",
+        bd=0,
+        padx=14,
+        cursor="hand2",
+    ).pack(side="right", padx=(0, 8))
+
+    window.protocol("WM_DELETE_WINDOW", window.destroy)
+    window.bind("<Escape>", lambda _event: window.destroy())
+    window.bind("<Return>", submit)
+    window.update_idletasks()
+    top = parent.winfo_toplevel()
+    x = top.winfo_rootx() + (top.winfo_width() - window.winfo_reqwidth()) // 2
+    y = top.winfo_rooty() + (top.winfo_height() - window.winfo_reqheight()) // 2
+    x = _clamp(x, 0, max(0, window.winfo_screenwidth() - window.winfo_reqwidth()))
+    y = _clamp(y, 0, max(0, window.winfo_screenheight() - window.winfo_reqheight()))
+    window.geometry(f"+{x}+{y}")
+    window.deiconify()
+    window.grab_set()
+    parent.wait_window(window)
+    return result[0]
 
 
 class WindowStateStore:
@@ -1781,9 +2190,10 @@ class OverlayApp:
         task: TaskState | None = None,
         on_state_change: Callable[["OverlayApp"], None] | None = None,
         on_focus_complete: Callable[["OverlayApp"], None] | None = None,
-        on_open_focus: Callable[["OverlayApp"], None] | None = None,
+        on_timer_complete: Callable[["OverlayApp"], None] | None = None,
         on_bind_task: Callable[["OverlayApp", int], None] | None = None,
-        on_list_tasks: Callable[[], list[int]] | None = None,
+        on_list_tasks: Callable[[], list[TaskState]] | None = None,
+        on_todo_due: Callable[["OverlayApp", int], None] | None = None,
         browser_data_dir: Path | None = None,
         browser_session_factory: Callable[[], object] | None = None,
     ) -> None:
@@ -1791,9 +2201,10 @@ class OverlayApp:
         self.on_close = on_close
         self.on_state_change = on_state_change
         self.on_focus_complete = on_focus_complete
-        self.on_open_focus = on_open_focus
+        self.on_timer_complete = on_timer_complete
         self.on_bind_task = on_bind_task
         self.on_list_tasks = on_list_tasks
+        self.on_todo_due = on_todo_due
         self.instance_number = instance_number
         self.task = task or TaskState(instance_number)
         self._syncing_task = False
@@ -1816,6 +2227,7 @@ class OverlayApp:
             saved_state is None or saved_state.get("mode") != "浏览器"
         )
         self._editing_todo_index: int | None = None
+        self._todo_overdue_state: tuple[bool, ...] = ()
         self._switch_targets: list[int] = []
         self._switch_index = 0
         self._tick_after_id: str | None = None
@@ -1888,11 +2300,14 @@ class OverlayApp:
         return self.task.id
 
     @property
-    def todo_items(self) -> list[tuple[str, bool]]:
+    def todo_items(self) -> list[tuple[str, bool, float | None, float | None]]:
         return self.task.todos
 
     @todo_items.setter
-    def todo_items(self, value: list[tuple[str, bool]]) -> None:
+    def todo_items(
+        self,
+        value: list[tuple[str, bool, float | None, float | None]],
+    ) -> None:
         self.task.todos = value
 
     @property
@@ -1964,8 +2379,8 @@ class OverlayApp:
                 self.note_text.insert("1.0", self.task.note)
                 self.note_text.edit_modified(False)
             expected_todos = tuple(
-                f"{'☑' if done else '☐'}  {title}"
-                for title, done in self.todo_items
+                _todo_display_text(item)
+                for item in self.todo_items
             )
             if self.todo_list.get(0, "end") != expected_todos:
                 selected = self._selected_todo_index()
@@ -2363,27 +2778,38 @@ class OverlayApp:
         self.todo_actions = tk.Frame(todo_view, bg=BG_PANEL)
         self.todo_actions.pack(side="bottom", fill="x", pady=(4, 0))
         self._register_mode_style(self.todo_actions, bg=BG_PANEL)
-        for name, label, action in (
-            ("todo_toggle_button", "完成 / 撤销", self._toggle_todo),
-            ("todo_edit_button", "编辑选中", self._edit_todo),
-            ("todo_delete_button", "删除选中", self._delete_todo),
-            ("todo_focus_button", "开始专注", self._start_focus_for_selected),
-        ):
-            button = tk.Button(
-                self.todo_actions,
-                text=label,
-                command=action,
-                bg=BG_BODY,
-                fg=TEXT_MUTED,
-                relief="flat",
-                bd=0,
-                padx=8,
-                cursor="hand2",
-                font=("Microsoft YaHei UI", 8),
+        for row_index, row_definitions in enumerate(
+            (
+                (
+                    ("todo_toggle_button", "完成 / 撤销", self._toggle_todo),
+                    ("todo_edit_button", "编辑选中", self._edit_todo),
+                    ("todo_delete_button", "删除选中", self._delete_todo),
+                ),
+                (
+                    ("todo_due_button", "设置截止", self._request_todo_due),
+                    ("todo_focus_button", "开始专注", self._start_focus_for_selected),
+                ),
             )
-            setattr(self, name, button)
-            button.pack(side="left", padx=(0, 8))
-            self._register_mode_style(button, bg=BG_BODY, fg=TEXT_MUTED)
+        ):
+            row = tk.Frame(self.todo_actions, bg=BG_PANEL)
+            row.pack(fill="x", pady=(0, 4) if row_index == 0 else 0)
+            self._register_mode_style(row, bg=BG_PANEL)
+            for name, label, action in row_definitions:
+                button = tk.Button(
+                    row,
+                    text=label,
+                    command=action,
+                    bg=BG_BODY,
+                    fg=TEXT_MUTED,
+                    relief="flat",
+                    bd=0,
+                    padx=8,
+                    cursor="hand2",
+                    font=("Microsoft YaHei UI", 8),
+                )
+                setattr(self, name, button)
+                button.pack(side="left", padx=(0, 8))
+                self._register_mode_style(button, bg=BG_BODY, fg=TEXT_MUTED)
         self.todo_list.pack(fill="both", expand=True)
 
         self.timer_minutes = tk.IntVar(master=self.root, value=25)
@@ -2692,18 +3118,8 @@ class OverlayApp:
     def _request_task_binding(self) -> None:
         if self._closed or self.on_bind_task is None:
             return
-        task_ids = self.on_list_tasks() if self.on_list_tasks is not None else []
-        shown_ids = ", ".join(f"#{task_id}" for task_id in task_ids[:20])
-        if len(task_ids) > 20:
-            shown_ids += " …"
-        task_id = simpledialog.askinteger(
-            "绑定任务",
-            "输入任务编号；已有任务会共享内容，不存在的编号会新建任务。"
-            + (f"\n已有任务：{shown_ids}" if shown_ids else ""),
-            parent=self.root,
-            initialvalue=self.task_id,
-            minvalue=1,
-        )
+        tasks = self.on_list_tasks() if self.on_list_tasks is not None else []
+        task_id = _prompt_task_binding(self.root, self.task_id, tasks)
         if task_id is not None:
             self.on_bind_task(self, task_id)
 
@@ -2913,8 +3329,7 @@ class OverlayApp:
             content = note if note.strip() else "空便签"
         elif self.mode == "待办":
             content = "\n".join(
-                f"{'☑' if done else '☐'}  {title}"
-                for title, done in self.todo_items
+                _todo_display_text(item) for item in self.todo_items
             ) or "暂无待办"
         elif self.mode == "任务胶囊":
             index = self._focus_task_index
@@ -3072,8 +3487,8 @@ class OverlayApp:
             return
         editing = self._editing_todo_index
         if editing is not None and 0 <= editing < len(self.todo_items):
-            _, done = self.todo_items[editing]
-            self.todo_items[editing] = (title, done)
+            item = self.todo_items[editing]
+            self.todo_items[editing] = (title, item[1], item[2], item[3])
             self._cancel_todo_edit()
             self._render_todos(editing)
             self._update_focus_display()
@@ -3087,7 +3502,7 @@ class OverlayApp:
         title = " ".join(title.split())
         if not title:
             return
-        self.todo_items.append((title, False))
+        self.todo_items.append((title, False, None, time.time()))
         self._render_todos(len(self.todo_items) - 1)
         self._notify_state_changed()
 
@@ -3125,18 +3540,56 @@ class OverlayApp:
 
     def _render_todos(self, selected: int | None = None) -> None:
         self.todo_list.delete(0, "end")
-        for title, done in self.todo_items:
-            self.todo_list.insert("end", f"{'☑' if done else '☐'}  {title}")
+        for item in self.todo_items:
+            self.todo_list.insert("end", _todo_display_text(item))
+        self._apply_todo_styles(force=True)
         if selected is not None and 0 <= selected < len(self.todo_items):
             self.todo_list.selection_set(selected)
         self._refresh_outlined_content()
+
+    def _apply_todo_styles(self, *, notify: bool = False, force: bool = False) -> None:
+        now = time.time()
+        overdue_states: list[bool] = []
+        for index, item in enumerate(self.todo_items):
+            overdue = item[2] is not None and not item[1] and item[2] <= now
+            overdue_states.append(overdue)
+            if overdue and notify and self.on_todo_due is not None:
+                self.on_todo_due(self, index)
+        states = tuple(overdue_states)
+        if force or states != self._todo_overdue_state:
+            self._todo_overdue_state = states
+            list_count = self.todo_list.size()
+            for index, overdue in enumerate(states):
+                if index >= list_count:
+                    break
+                self.todo_list.itemconfig(
+                    index,
+                    fg=DUE_OVERDUE if overdue else TEXT,
+                )
+
+    def _request_todo_due(self) -> None:
+        selected = self._selected_todo_index()
+        if selected is None:
+            return
+        title, done, due, created = self.todo_items[selected]
+        accepted, value = _prompt_todo_due(
+            self.root,
+            title,
+            due if due is not None else created,
+        )
+        if not accepted:
+            return
+        self.todo_items[selected] = (title, done, value, created)
+        self._render_todos(selected)
+        self._update_focus_display()
+        self._notify_state_changed()
 
     def _toggle_todo(self, _event: tk.Event | None = None) -> None:
         selected = self._selected_todo_index()
         if selected is None:
             return
-        title, done = self.todo_items[selected]
-        self.todo_items[selected] = (title, not done)
+        title, done, due, created = self.todo_items[selected]
+        self.todo_items[selected] = (title, not done, due, created)
         self._render_todos(selected)
         self._update_focus_display()
         self._notify_state_changed()
@@ -3172,10 +3625,7 @@ class OverlayApp:
         self._focus_status = "running"
         self._update_focus_display()
         self._notify_state_changed()
-        if self.on_open_focus is not None:
-            self.on_open_focus(self)
-        else:
-            self.set_mode("任务胶囊")
+        self.set_mode("任务胶囊")
 
     def _toggle_focus(self) -> None:
         if self._focus_task_index is None:
@@ -3207,8 +3657,8 @@ class OverlayApp:
         index = self._focus_task_index
         if index is None:
             return
-        title, _done = self.todo_items[index]
-        self.todo_items[index] = (title, True)
+        title, _done, due, created = self.todo_items[index]
+        self.todo_items[index] = (title, True, due, created)
         self._focus_deadline = None
         self._focus_status = "finished"
         self._render_todos(index)
@@ -3218,7 +3668,7 @@ class OverlayApp:
     def _update_focus_display(self) -> None:
         index = self._focus_task_index
         if index is not None and 0 <= index < len(self.todo_items):
-            title, done = self.todo_items[index]
+            title, done = self.todo_items[index][0], self.todo_items[index][1]
             short_title = title[:44] + ("…" if len(title) > 44 else "")
             self.focus_task_label.configure(text=f"{'☑' if done else '☐'}  {short_title}")
         else:
@@ -3317,6 +3767,10 @@ class OverlayApp:
             if self._timer_remaining_seconds == 0:
                 self._timer_deadline = None
                 self.task.timer_status = "finished"
+                if self.visible:
+                    self.root.bell()
+                if self.on_timer_complete is not None:
+                    self.on_timer_complete(self)
                 self._notify_state_changed()
             self._update_timer_display()
         if self._focus_deadline is not None:
@@ -3332,6 +3786,7 @@ class OverlayApp:
                     self.on_focus_complete(self)
                 self._notify_state_changed()
             self._update_focus_display()
+        self._apply_todo_styles(notify=True)
         now = time.localtime()
         self.clock_time_label.configure(text=time.strftime("%H:%M:%S", now))
         weekday = "一二三四五六日"[now.tm_wday]
@@ -4351,6 +4806,13 @@ class DesktopManager:
         self._task_snapshots = {
             task_id: task.snapshot() for task_id, task in self._tasks.items()
         }
+        startup_now = time.time()
+        self._notified_todo_dues: set[tuple[int, float | None, float]] = {
+            (task_id, created, due)
+            for task_id, task in self._tasks.items()
+            for _title, done, due, created in task.todos
+            if not done and due is not None and due <= startup_now
+        }
         self._next_instance_number = max(
             (int(record["id"]) for record in self._window_records),
             default=0,
@@ -4488,9 +4950,13 @@ class DesktopManager:
     ) -> OverlayApp:
         saved_state = None
         if initial_position is None and task_id is None:
-            saved_state = next(
-                (record for record in reversed(self._window_records) if not record["active"]),
-                None,
+            saved_state = min(
+                (
+                    record for record in self._window_records
+                    if not record["active"]
+                ),
+                key=lambda record: int(record["id"]),
+                default=None,
             )
         if saved_state is not None:
             return self._open_window(saved_state)
@@ -4552,9 +5018,10 @@ class DesktopManager:
             task=task,
             on_state_change=self._on_window_state_changed,
             on_focus_complete=self._on_focus_complete,
-            on_open_focus=self._open_focus_window,
+            on_timer_complete=self._on_timer_complete,
             on_bind_task=self.bind_window_to_task,
-            on_list_tasks=lambda: sorted(self._tasks),
+            on_list_tasks=self._task_summaries,
+            on_todo_due=self._on_todo_due,
             browser_session_factory=self._get_browser_session,
         )
         if saved_state is None:
@@ -4573,31 +5040,8 @@ class DesktopManager:
         task = self._tasks.setdefault(task_id, TaskState(task_id))
         window.bind_task(task)
 
-    def _open_focus_window(self, source: OverlayApp) -> None:
-        existing = next(
-            (
-                window for window in self.windows
-                if window is not source
-                and window.task is source.task
-                and window.mode == "任务胶囊"
-            ),
-            None,
-        )
-        if existing is not None:
-            if existing.collapsed and not existing.animating:
-                existing._restore_from_ball()
-            elif not existing.locked and self.visible:
-                existing.root.lift()
-            return
-        if source.collapsed and source._ball_geometry is not None:
-            x, y = source._ball_geometry[2:]
-        else:
-            x, y = source.root.winfo_x(), source.root.winfo_y()
-        capsule = self.add_window(
-            initial_position=(x + 36, y + 36),
-            task_id=source.task_id,
-        )
-        capsule.set_mode("任务胶囊")
+    def _task_summaries(self) -> list[TaskState]:
+        return [task for _task_id, task in sorted(self._tasks.items())]
 
     def _on_window_state_changed(self, window: OverlayApp) -> None:
         if self._exiting:
@@ -4702,6 +5146,28 @@ class DesktopManager:
         self.tray.notify(
             "专注时间到了",
             f"{window.todo_items[index][0][:100]} —— 可以标记完成了",
+        )
+
+    def _on_timer_complete(self, window: OverlayApp) -> None:
+        self.tray.notify(
+            "倒计时结束",
+            f"自由窗口 #{window.instance_number}（任务 #{window.task_id}）的倒计时已结束。",
+        )
+
+    def _on_todo_due(self, window: OverlayApp, index: int) -> None:
+        task = window.task
+        if not 0 <= index < len(task.todos):
+            return
+        title, done, due, created = task.todos[index]
+        if done or due is None or due > time.time():
+            return
+        key = (task.id, created, due)
+        if key in self._notified_todo_dues:
+            return
+        self._notified_todo_dues.add(key)
+        self.tray.notify(
+            "待办已到期",
+            f"{title[:100]} —— 截止 {_format_due_timestamp(due)}",
         )
 
     def open_quick_capture(self, *, prefill_clipboard: bool = True) -> None:
@@ -5545,6 +6011,11 @@ def _self_test() -> None:
         )
         return [canvas.itemcget(item, "text") for item in fill_items]
 
+    def todo_faces(
+        items: list[tuple[str, bool, float | None, float | None]],
+    ) -> list[tuple[str, bool]]:
+        return [(title, done) for title, done, _due, _created in items]
+
     app = OverlayApp(visible=False)
     app.root.update()
     assert _position_from_arguments(["--position", "-120", "80"]) == (-120, 80)
@@ -5578,37 +6049,68 @@ def _self_test() -> None:
     app.note_text.insert("1.0", "临时想法")
     app.mode_menu.invoke(1)
     assert app.mode == "待办", "mode menu did not switch the window purpose"
+    assert max(
+        row.winfo_reqwidth() for row in app.todo_actions.winfo_children()
+    ) <= MIN_WIDTH - 60, "待办操作按钮在最小窗口宽度下放不下"
     app.todo_input.insert(0, "检查切换")
     app._add_todo()
-    assert app.todo_items == [("检查切换", False)]
+    assert todo_faces(app.todo_items) == [("检查切换", False)]
     app.todo_list.selection_set(0)
+    assert _due_epoch_from_fields(2026, 9, 22, 21, 30, 15) == time.mktime(
+        (2026, 9, 22, 21, 30, 15, 0, 0, -1)
+    )
+    for invalid_due in ((2026, 2, 30, 0, 0, 0), (2026, 13, 1, 0, 0, 0)):
+        try:
+            _due_epoch_from_fields(*invalid_due)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid due date was accepted: {invalid_due}")
+    original_prompt_due = globals()["_prompt_todo_due"]
+    globals()["_prompt_todo_due"] = lambda *_args, **_kwargs: (True, time.time() - 5)
+    try:
+        app.todo_due_button.invoke()
+    finally:
+        globals()["_prompt_todo_due"] = original_prompt_due
+    assert app.todo_items[0][2] is not None
+    assert "⏰" in app.todo_list.get(0)
+    app._apply_todo_styles(force=True)
+    assert app.todo_list.itemcget(0, "fg") == DUE_OVERDUE
+    globals()["_prompt_todo_due"] = lambda *_args, **_kwargs: (True, None)
+    try:
+        app.todo_due_button.invoke()
+    finally:
+        globals()["_prompt_todo_due"] = original_prompt_due
+    assert app.todo_items[0][2] is None
+    assert "⏰" not in app.todo_list.get(0)
+    assert app.todo_list.itemcget(0, "fg") == TEXT
     app._toggle_todo()
-    assert app.todo_items == [("检查切换", True)]
+    assert todo_faces(app.todo_items) == [("检查切换", True)]
     app.todo_edit_button.invoke()
     assert app.todo_input.get() == "检查切换"
     assert app.todo_add_button.cget("text") == "保存修改"
     app.todo_input.delete(0, "end")
     app.todo_input.insert(0, "修改后的待办")
     app.todo_add_button.invoke()
-    assert app.todo_items == [("修改后的待办", True)]
+    assert todo_faces(app.todo_items) == [("修改后的待办", True)]
     assert app.todo_add_button.cget("text") == "添加"
     app._edit_todo()
     app.todo_input.delete(0, "end")
     app.todo_input.insert(0, "不保存")
     app.todo_cancel_button.invoke()
-    assert app.todo_items == [("修改后的待办", True)]
+    assert todo_faces(app.todo_items) == [("修改后的待办", True)]
     app.todo_input.insert(0, "临时待办")
     app._add_todo()
     app.todo_list.selection_clear(0, "end")
     app.todo_list.selection_set(1)
     app.todo_delete_button.invoke()
-    assert app.todo_items == [("修改后的待办", True)]
+    assert todo_faces(app.todo_items) == [("修改后的待办", True)]
     app.todo_list.selection_set(0)
     app._edit_todo()
     app.todo_input.delete(0, "end")
     app.todo_input.insert(0, "检查切换")
     app._add_todo()
-    assert app.todo_items == [("检查切换", True)]
+    assert todo_faces(app.todo_items) == [("检查切换", True)]
     app.timer_minutes.set(1)
     app.todo_focus_button.invoke()
     assert app.mode == "任务胶囊"
@@ -5627,7 +6129,7 @@ def _self_test() -> None:
         time.sleep(0.01)
     assert app._focus_status == "finished"
     app._complete_focus()
-    assert app.todo_items == [("检查切换", True)]
+    assert todo_faces(app.todo_items) == [("检查切换", True)]
     app._reset_focus()
     assert app.focus_time_label.cget("text") == "01:00"
     app.set_locked(True)
@@ -5665,7 +6167,7 @@ def _self_test() -> None:
     assert switched_windows == [202, 303, 101, 202], switched_windows
     app.set_mode("便签")
     assert app.note_text.get("1.0", "end-1c") == "临时想法"
-    assert app.todo_items == [("检查切换", True)]
+    assert todo_faces(app.todo_items) == [("检查切换", True)]
 
     _set_absolute_geometry(
         app.root,
@@ -6013,7 +6515,7 @@ def _self_test() -> None:
         directory=Path(temporary_settings_directory.name) / "updates",
         opener=fake_release_opener,
     )
-    assert _version_numbers("2.2.3") > _version_numbers(APP_VERSION)
+    assert _version_numbers("2.3.1") > _version_numbers(APP_VERSION)
     assert release_client.latest() == fake_manifest
     staged_test_package = release_client.download(fake_manifest)
     assert staged_test_package.read_bytes() == fake_package
@@ -6166,9 +6668,12 @@ def _self_test() -> None:
     assert saved_windows[0]["task_id"] == first_window.instance_number
     assert saved_windows[1]["task_id"] == second_window.instance_number
     assert saved_tasks[first_window.task_id]["note"] == "第一扇便签"
-    assert saved_tasks[first_window.task_id]["todos"] == [
-        {"text": "改好的待办", "done": True}
-    ]
+    saved_todos = saved_tasks[first_window.task_id]["todos"]
+    assert len(saved_todos) == 1
+    assert saved_todos[0]["text"] == "改好的待办"
+    assert saved_todos[0]["done"] is True
+    assert saved_todos[0]["due"] is None
+    assert type(saved_todos[0]["created"]) is float
     assert saved_tasks[first_window.task_id]["timer_minutes"] == 7
     assert saved_tasks[second_window.task_id]["note"] == "第二扇便签"
     assert not any(record["locked"] for record in saved_windows)
@@ -6193,7 +6698,7 @@ def _self_test() -> None:
         update_client=current_client,
     )
     assert migrated_manager.windows[0].task_id == first_window.instance_number
-    assert migrated_manager.windows[0].todo_items == [("改好的待办", True)]
+    assert todo_faces(migrated_manager.windows[0].todo_items) == [("改好的待办", True)]
     migrated_manager._save_window_states_now()
     migrated_state = json.loads(legacy_path.read_text(encoding="utf-8"))
     assert migrated_state["version"] == 2
@@ -6316,7 +6821,7 @@ def _self_test() -> None:
     assert revived_first.instance_number == first_window.instance_number
     assert revived_first.mode == "待办"
     assert revived_first.note_text.get("1.0", "end-1c") == "第一扇便签"
-    assert revived_first.todo_items == [("改好的待办", True)]
+    assert todo_faces(revived_first.todo_items) == [("改好的待办", True)]
     assert revived_first.timer_minutes.get() == 7
     assert _native_window_geometry(revived_first.root) == (
         470, 310, test_x, test_y
@@ -6374,7 +6879,7 @@ def _self_test() -> None:
     assert not reloaded_second.locked
     reloaded_second.set_locked(True)
     assert reloaded_first.mode == "待办"
-    assert reloaded_first.todo_items == [("改好的待办", True)]
+    assert todo_faces(reloaded_first.todo_items) == [("改好的待办", True)]
     assert reloaded_first.timer_minutes.get() == 7
     assert reloaded_first.collapsed
     assert reloaded_first._ball_geometry == test_ball
@@ -6398,11 +6903,24 @@ def _self_test() -> None:
     )
     assert len(closed_reopen_manager.windows) == 1
     reopened = closed_reopen_manager.windows[0]
-    assert reopened.instance_number == second_window.instance_number
-    assert reopened.mode == "便签"
-    assert reopened.note_text.get("1.0", "end-1c") == "第二扇便签"
-    assert reopened.locked
-    assert reopened.unlock_canvas.winfo_ismapped()
+    assert reopened.instance_number == first_window.instance_number
+    assert reopened.mode == "待办"
+    assert reopened.note_text.get("1.0", "end-1c") == "第一扇便签"
+    assert not reopened.locked
+    second_closed = closed_reopen_manager.add_window()
+    assert second_closed.instance_number == second_window.instance_number
+    assert second_closed.mode == "便签"
+    assert second_closed.note_text.get("1.0", "end-1c") == "第二扇便签"
+    assert second_closed.locked
+    assert second_closed.unlock_canvas.winfo_ismapped()
+    third_window = closed_reopen_manager.add_window()
+    assert third_window.instance_number == second_window.instance_number + 1
+    reopened.close()
+    third_window.close()
+    restored_first = closed_reopen_manager.add_window()
+    assert restored_first.instance_number == first_window.instance_number
+    restored_third = closed_reopen_manager.add_window()
+    assert restored_third.instance_number == third_window.instance_number
     assert closed_reopen_manager.auto_start.get() is True
     closed_reopen_manager.exit_app()
 
@@ -6426,16 +6944,16 @@ def _self_test() -> None:
     todo_window = capture_manager.windows[0]
     assert todo_window.mode == "待办"
     assert todo_window.task_id == todo_window.instance_number
-    assert todo_window.todo_items == [("快速收集的待办", False)]
+    assert todo_faces(todo_window.todo_items) == [("快速收集的待办", False)]
     todo_window.timer_minutes.set(3)
     todo_window._start_focus_for_selected()
-    assert len(capture_manager.windows) == 2
-    focus_window = capture_manager.windows[-1]
-    assert todo_window.mode == "待办"
+    assert len(capture_manager.windows) == 1, "开始专注不应额外生成窗口"
+    focus_window = todo_window
     assert focus_window.mode == "任务胶囊"
-    assert focus_window.instance_number != todo_window.instance_number
-    assert focus_window.task_id == todo_window.task_id
-    assert focus_window.task is todo_window.task
+    assert focus_window.instance_number == focus_window.task_id
+    assert focus_window._focus_task_index == 0
+    assert focus_window._focus_status == "running"
+    assert 0 < focus_window._focus_remaining_seconds <= 180
     _set_absolute_geometry(
         focus_window.root,
         width=MIN_WIDTH,
@@ -6456,35 +6974,53 @@ def _self_test() -> None:
     capture_manager.open_quick_capture(prefill_clipboard=False)
     capture_manager.quick_capture_text.insert("1.0", "第二项待办")
     capture_manager._save_quick_capture("待办")
-    assert len(capture_manager.windows) == 2
-    assert focus_window.todo_items == [
+    assert len(capture_manager.windows) == 1
+    assert todo_faces(focus_window.todo_items) == [
         ("快速收集的待办", False), ("第二项待办", False)
     ]
-    assert todo_window.todo_items == focus_window.todo_items
     capture_manager.open_quick_capture(prefill_clipboard=False)
     capture_manager.quick_capture_text.insert("1.0", "第一段便签")
     capture_manager._save_quick_capture("便签")
-    assert len(capture_manager.windows) == 3
+    assert len(capture_manager.windows) == 2
     note_window = capture_manager.windows[-1]
     assert note_window.mode == "便签"
     assert note_window.task_id == note_window.instance_number
     capture_manager.open_quick_capture(prefill_clipboard=False)
     capture_manager.quick_capture_text.insert("1.0", "第二段便签")
     capture_manager._save_quick_capture("便签")
-    assert len(capture_manager.windows) == 3
+    assert len(capture_manager.windows) == 2
     assert note_window.note_text.get("1.0", "end-1c") == "第一段便签\n\n第二段便签"
 
     linked_window = capture_manager.add_window(initial_position=(100, 100))
     assert linked_window.task_id == linked_window.instance_number
     assert linked_window.task is not todo_window.task
     linked_window.append_note_text("原来的独立内容")
-    original_askinteger = simpledialog.askinteger
+    summary_by_id = {
+        task.id: _task_content_summary(task)
+        for task in capture_manager._task_summaries()
+    }
+    assert summary_by_id[todo_window.task_id].startswith("待办 2 项")
+    assert "任务胶囊：快速收集的待办（已暂停）" in summary_by_id[todo_window.task_id]
+    assert summary_by_id[note_window.task_id] == "便签 10 字"
+    assert summary_by_id[linked_window.task_id] == "便签 7 字"
+    assert _task_content_summary(TaskState(99)) == ""
+    original_prompt = globals()["_prompt_task_binding"]
+    prompt_calls: list[tuple[int, list[int]]] = []
+    linked_task_id = linked_window.task_id
+
+    def fake_prompt(_parent, current_task_id, tasks):
+        prompt_calls.append((current_task_id, [task.id for task in tasks]))
+        return todo_window.task_id
+
+    globals()["_prompt_task_binding"] = fake_prompt
     try:
-        simpledialog.askinteger = lambda *_args, **_kwargs: todo_window.task_id
         linked_window.mode_menu.invoke(len(WINDOW_MODES) + 1)
         capture_manager.root.update()
     finally:
-        simpledialog.askinteger = original_askinteger
+        globals()["_prompt_task_binding"] = original_prompt
+    assert prompt_calls == [
+        (linked_task_id, sorted(capture_manager._tasks))
+    ]
     assert linked_window.task is todo_window.task is focus_window.task
     assert linked_window.instance_number != linked_window.task_id
     assert linked_window.note_text.get("1.0", "end-1c") == ""
@@ -6495,7 +7031,7 @@ def _self_test() -> None:
     capture_manager.root.update()
     assert todo_window.note_text.get("1.0", "end-1c") == "共享便签！"
     linked_window.add_todo_text("跨窗口同步事项")
-    assert todo_window.todo_items[-1] == ("跨窗口同步事项", False)
+    assert todo_faces(todo_window.todo_items)[-1] == ("跨窗口同步事项", False)
     assert todo_window.todo_list.get("end") == "☐  跨窗口同步事项"
     capture_manager.bind_window_to_task(linked_window, linked_window.instance_number)
     assert linked_window.note_text.get("1.0", "end-1c") == "原来的独立内容"
@@ -6511,6 +7047,39 @@ def _self_test() -> None:
     assert todo_window.timer_start_button.cget("text") == "继续"
     focus_window._toggle_focus()
     assert focus_window._focus_status == "running"
+    notifications: list[tuple[str, str]] = []
+    original_notify = capture_manager.tray.notify
+    capture_manager.tray.notify = lambda title, message: notifications.append(
+        (title, message)
+    )
+    try:
+        overdue = focus_window.todo_items[0]
+        focus_window.todo_items[0] = (
+            overdue[0], overdue[1], time.time() - 5, overdue[3]
+        )
+        capture_manager._notified_todo_dues.clear()
+        focus_window._apply_todo_styles(notify=True)
+        assert any(title == "待办已到期" for title, _message in notifications)
+        assert len(capture_manager._notified_todo_dues) == 1
+        focus_window._apply_todo_styles(notify=True)
+        assert len(capture_manager._notified_todo_dues) == 1, "同一条待办重复提醒"
+        assert len(
+            [title for title, _message in notifications if title == "待办已到期"]
+        ) == 1
+        linked_window.timer_minutes.set(4)
+        linked_window._toggle_timer()
+        linked_window._timer_deadline = time.monotonic() - 1
+        timer_deadline = time.monotonic() + 1
+        while (
+            linked_window.task.timer_status != "finished"
+            and time.monotonic() < timer_deadline
+        ):
+            capture_manager.root.update()
+            time.sleep(0.01)
+        assert linked_window.task.timer_status == "finished"
+        assert any(title == "倒计时结束" for title, _message in notifications)
+    finally:
+        capture_manager.tray.notify = original_notify
     capture_manager._save_window_states_now()
     capture_manager.exit_app()
     capture_reopened = DesktopManager(
@@ -6520,7 +7089,7 @@ def _self_test() -> None:
         auto_start_store=MemoryAutoStartStore(),
         update_client=current_client,
     )
-    assert len(capture_reopened.windows) == 4
+    assert len(capture_reopened.windows) == 3
     restored_focus = next(
         window for window in capture_reopened.windows
         if window.mode == "任务胶囊"
@@ -6528,21 +7097,21 @@ def _self_test() -> None:
     assert restored_focus._focus_status == "paused"
     assert 0 < restored_focus._focus_remaining_seconds <= 180
     assert restored_focus.focus_time_label.cget("text").startswith(("02:", "03:"))
-    assert restored_focus.todo_items == [
+    assert todo_faces(restored_focus.todo_items) == [
         ("快速收集的待办", False),
         ("第二项待办", False),
         ("跨窗口同步事项", False),
     ]
-    restored_todo = next(
-        window for window in capture_reopened.windows
-        if window.mode == "待办"
-    )
-    assert restored_focus.task is restored_todo.task
+    restored_overdue = restored_focus.todo_items[0]
+    assert restored_overdue[2] is not None
+    assert (
+        restored_focus.task_id, restored_overdue[3], restored_overdue[2]
+    ) in capture_reopened._notified_todo_dues
     restored_linked = next(
         window for window in capture_reopened.windows
         if window.mode == "倒计时"
     )
-    assert restored_linked.task is restored_todo.task
+    assert restored_linked.task is restored_focus.task
     assert restored_linked.task_id != restored_linked.instance_number
     assert restored_linked.note_text.get("1.0", "end-1c") == "共享便签！"
     assert restored_linked.timer_minutes.get() == 4
@@ -6555,11 +7124,10 @@ def _self_test() -> None:
         for task in saved_capture["tasks"]
     )
     restored_focus._complete_focus()
-    assert restored_todo.todo_items[0] == ("快速收集的待办", True)
+    assert todo_faces(restored_focus.todo_items)[0] == ("快速收集的待办", True)
     restored_linked._toggle_focus()
-    assert restored_todo._focus_status == "running"
+    assert restored_focus._focus_status == "running"
     restored_focus.close()
-    restored_todo.close()
     assert restored_linked._focus_status == "running"
     restored_linked.close()
     assert restored_linked.task.focus_status == "paused"
@@ -6702,7 +7270,8 @@ def _self_test() -> None:
         "verified GitHub update index and persistent auto-update option, "
         "independent window/task ids, shared task views and legacy migration, "
         "seven window modes including a per-window browser, persistent task focus and a cycling window switcher, "
-        "editable and removable todos, "
+        "editable and removable todos, per-todo deadlines with one-off reminders, "
+        "timer completion notices, "
         "quick capture to existing or new windows, "
         "empty-note placeholder, "
         "no-background mode, persistent content-visible click-through lock, "
