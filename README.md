@@ -8,6 +8,8 @@ Windows 可直接双击 `dist/DesktopTools.exe` 启动，无需安装 Python。�
 
 程序启动后会在任务栏右下角通知区域显示托盘图标。右键托盘图标可选择：
 
+托盘、程序文件和窗口统一使用薄荷绿色的叠放窗口图标。界面采用深灰蓝底色与薄荷绿强调色；设置分为“外观与窗口”“快捷与启动”“更新与存档”三个页签，内容可用滚轮或右侧滚动条查看，底部操作按钮固定，窗口高度可调整。空便签显示输入引导，窗口用途、任务状态和主要操作有独立的视觉层级。
+
 DesktopTools 只允许一个后台实例运行。已经运行时再次双击 EXE，不会再创建第二套托盘与自由窗口；程序会切换到现有实例，并恢复被快捷隐藏的窗口。如果此前已关闭全部自由窗口，则会在现有实例中添加一个窗口。
 
 - **添加自由窗口**：绿色加号，在当前后台进程中创建一个新的独立窗口实例。
@@ -52,6 +54,12 @@ DesktopTools 只允许一个后台实例运行。已经运行时再次双击 EXE
 
 全局设置保存在 `%LOCALAPPDATA%\DesktopTools\settings.json`，窗口与任务存档分别保存在同目录 `windows.json` 的 `windows` 和 `tasks` 部分；旧版逐窗口内容会自动迁移。修改后会自动写入磁盘，关闭窗口和退出程序时也会立即保存；写入时使用临时文件原子替换，避免中断损坏原文件。窗口以小球收起时的状态和位置、锁定状态同样会恢复；恢复锁定窗口时，独立解锁图标仍可点击。便签与待办内容是本机明文文件，请勿在其中记录密码等敏感信息。
 
+已有存档损坏或结构无法识别时，程序会先把原文件的完整字节保存在同目录的 `windows.json.recovery-*.bak` 或 `settings.json.recovery-*.bak`，再建立新存档，并提示恢复副本位置。如果无法读取或备份原文件，会禁止覆盖，直到重试成功。恢复副本不会被自动删除。
+
+退出时如果窗口或设置保存失败，程序会继续运行以保留内存中的内容。设置的“更新与存档”页提供“重试保存”和“导出备份…”；导出的 JSON 包含全部窗口和任务，可以保存到其他可写入的位置。快速收集写盘失败时不会显示“已保存”，内容仍保留在目标任务中，重试保存不会重复追加。
+
+需要手动恢复时，先保留现有文件副本并退出程序，将有效的窗口与任务备份复制为 `windows.json` 后重新启动。损坏文件的 `.bak` 保留原始内容，可能需要先修复 JSON；不要直接把无效 JSON 当作正常备份覆盖。诊断日志位于 `%LOCALAPPDATA%\DesktopTools\logs\desktoptools.log`，记录启动、回调、存储和更新安装错误，按大小轮换；日志不主动记录便签、待办或剪贴板正文。
+
 “开机启动”默认关闭。开启后会在当前用户的 Windows `Run` 注册表项中记录程序路径，无需管理员权限；关闭或恢复默认设置会移除此项。建议先把 EXE 放在固定位置再开启；如果之后移动了 EXE，从新位置手动运行一次会更新已启用的启动项。
 
 设置中的“快捷隐藏快捷键”可输入 `Ctrl+K`、`Ctrl+Shift+H` 等组合，点击“应用”生效并自动保存。主键支持字母、数字和 F1–F12，至少包含 Ctrl 或 Alt；`Ctrl+Alt+D` 留给快速收集。如果组合键被其他程序占用，设置会提示并保留此前可用的组合键。
@@ -62,4 +70,28 @@ DesktopTools 只允许一个后台实例运行。已经运行时再次双击 EXE
 
 版本号采用 `A.B.C`，首个版本为 `1.0.0`。今后**每次提交**按变更类型递增对应数字：系统框架或不兼容架构调整递增 `A`，新增或扩展功能模块递增 `B`，修复与一般修改（包括文档、界面细节）递增 `C`；递增较高位时，右侧数字归零。同一次提交涉及多类变更时取最高级别，版本号按提交次数而非功能数量计算。提交时同步修改 `overlay_window.pyw` 中的 `APP_VERSION`，用 `python build_release.py` 重新打包并生成匹配的 `dist/update.json`，把源码、EXE 和索引一起提交。提交日志必须使用中文，带上版本号并写明本次变更内容，例如 `功能版本 2.2.0：新增浏览器与快捷隐藏功能`。用户只说“推送”时，执行提交和推送，不自动发布 Release。推送 `main` 后，用户端才会看见新版本。仅在明确要求发布版本时，再建立同号的附注标签 `vA.B.C` 并推送；仓库的 GitHub Actions 会核对版本、大小及 SHA-256，再将 EXE 和索引作为 GitHub Release 附件发布，标签说明会作为发布说明。GitHub Actions 使用 GitHub 自带的临时令牌，本机无需保存 GitHub API 令牌。
 
-除浏览器控件依赖 `tkwry` 和系统 WebView2 Runtime 外，程序主体使用 Python 标准库；托盘菜单图标由程序直接绘制，无需额外图片资源。`tkwry` 会被打包进 EXE，WebView2 Runtime 由 Windows 系统提供或单独安装。
+除浏览器控件依赖 `tkwry` 和系统 WebView2 Runtime 外，程序主体使用 Python 标准库。应用图标位于 `assets/DesktopTools.ico`，包含 16–256 像素的八档尺寸，构建时同时嵌入 EXE 并打包图像资源；可使用 `python scripts/generate_icon.py` 重新生成。托盘右键菜单中的小图标仍由程序绘制。`tkwry` 会被打包进 EXE，WebView2 Runtime 由 Windows 系统提供或单独安装。
+
+## 开发与验证
+
+打包基线为 Windows x64、CPython 3.14（本地验证为 3.14.7）。建议在独立虚拟环境中安装构建依赖；`requirements-build.txt` 固定 PyInstaller 及其构建依赖版本，并包含运行依赖。
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements-build.txt
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+.\.venv\Scripts\python.exe overlay_window.pyw --self-test
+```
+
+`unittest` 使用临时目录，覆盖存档保护、字段容错、共享任务保存、退出失败保留会话、任务改绑、更新下载校验和发布一致性；其中 Tk/Win32 管理器测试仅在 Windows 运行，不创建托盘图标。完整 `--self-test` 需要交互桌面和系统托盘，安装 `tkwry` 后还会检查 WebView2 控件；没有安装该依赖时浏览器检查会跳过，不能当成浏览器验证通过。
+
+验证构建可输出到独立目录，不替换正式包：
+
+```powershell
+.\.venv\Scripts\python.exe build_release.py --dist-dir build/verification-dist
+python build_release.py --verify-only --dist-dir build/verification-dist
+```
+
+正式提交仍按上面的版本约定递增版本，再运行 `python build_release.py` 更新 `dist`。`--verify-only` 核对源码版本、索引、包体大小及 SHA-256，可配合 `--tag vA.B.C` 核对发布标签。普通推送和 PR 会执行 Linux/Windows 回归测试及 Windows 候选构建；发布工作流复用相同的文件校验逻辑。文件校验不代替 EXE 启动和浏览器验收。
+
+工程中的 `desktoptools/state.py` 负责存储与任务状态，`updates.py` 负责更新下载与安装，`native.py` 封装 Win32 接口，`diagnostics.py` 负责日志；主入口保留 Tk 界面和窗口协调。存储与更新测试无需启动桌面界面。

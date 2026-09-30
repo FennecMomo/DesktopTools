@@ -1,0 +1,44 @@
+name: 工程回归检查
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: 存储、更新与窗口回归测试
+        run: python -m unittest discover -s tests -v
+      - name: 核对源码与发布文件
+        run: python build_release.py --verify-only
+
+  windows-build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-build.txt
+      - run: python -m pip install -r requirements-build.txt
+      - name: 验证可打包性
+        run: python build_release.py --dist-dir build/ci-dist

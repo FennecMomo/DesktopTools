@@ -4,16 +4,15 @@ import ctypes
 import hashlib
 import io
 import json
+import logging
 import math
-import os
-import re
-import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import tkinter as tk
+import tkinter.filedialog as filedialog
 import tkinter.messagebox as messagebox
 import urllib.error
 import urllib.parse
@@ -24,24 +23,101 @@ from collections.abc import Callable
 from ctypes import wintypes
 from pathlib import Path
 from queue import Empty, Queue
+from desktoptools.native import (
+    BI_RGB,
+    BitmapInfo,
+    BitmapInfoHeader,
+    DIB_RGB_COLORS,
+    GWL_EXSTYLE,
+    HIDE_HOTKEY_IDS,
+    HWND_TOPMOST,
+    IDI_APPLICATION,
+    LWA_ALPHA,
+    LWA_COLORKEY,
+    MENU_ICON_SIZE,
+    MF_SEPARATOR,
+    MF_STRING,
+    MIIM_BITMAP,
+    MOD_NOREPEAT,
+    MenuItemInfo,
+    NIF_ICON,
+    NIF_INFO,
+    NIF_MESSAGE,
+    NIF_TIP,
+    NIIF_INFO,
+    NIM_ADD,
+    NIM_DELETE,
+    NIM_MODIFY,
+    NotifyIconData,
+    Point,
+    QUICK_CAPTURE_HOTKEY_ID,
+    Rect,
+    SECOND_INSTANCE_MESSAGE_NAME,
+    SWP_FRAMECHANGED,
+    SWP_NOACTIVATE,
+    SWP_NOMOVE,
+    SWP_NOSIZE,
+    SingleInstanceGuard,
+    TPM_NONOTIFY,
+    TPM_RETURNCMD,
+    TPM_RIGHTBUTTON,
+    TRAY_CALLBACK_MESSAGE,
+    TRAY_COMMAND_ADD,
+    TRAY_COMMAND_CAPTURE,
+    TRAY_COMMAND_EXIT,
+    TRAY_COMMAND_SETTINGS,
+    TRAY_COMMAND_UPDATE,
+    TRAY_COMMAND_VISIBILITY,
+    WM_CONTEXTMENU,
+    WM_DESTROY,
+    WM_HOTKEY,
+    WM_LBUTTONDBLCLK,
+    WM_NULL,
+    WM_RBUTTONUP,
+    WS_EX_NOACTIVATE,
+    WS_EX_TRANSPARENT,
+    WindowClassEx,
+    WindowProcedure,
+    _activate_window,
+    _colorref,
+    _get_window_long,
+    _monitor_areas_at,
+    _native_window_geometry,
+    _set_absolute_geometry,
+    _set_layered_attributes,
+    _set_native_topmost,
+    _set_window_long,
+    _signal_existing_instance,
+    _switch_candidates,
+    _top_level_handle,
+    gdi32,
+    kernel32,
+    shell32,
+    user32,
+)
+from desktoptools.diagnostics import configure_logging, report_callback_exception
+from desktoptools.appearance import (
+    BG_OUTER, BG_TITLE, BG_BODY, BG_PANEL, BORDER, TEXT, TEXT_MUTED,
+    ACCENT, ACCENT_HOVER, HOVER, ICON_PATH, Toggle, ScrollableFrame,
+    brand_image, set_window_icon, button as styled_button,
+)
+from desktoptools.updates import (
+    UpdateClient, UpdateError, _apply_staged_update, _version_numbers,
+)
+
+from desktoptools.state import (
+    SettingsStore, TaskState, WindowStateStore,
+    RESTORE_MARGIN, WINDOW_MODES, DEFAULT_BROWSER_URL,
+    MOD_ALT, MOD_CONTROL, MOD_SHIFT,
+    _clamp, _default_settings_path, _browser_destination, _parse_hide_hotkey,
+)
 
 
 APP_TITLE = "DesktopTools 自由窗口"
-APP_VERSION = "2.3.0"
-UPDATE_MANIFEST_URL = (
-    "https://raw.githubusercontent.com/FennecMomo/DesktopTools/"
-    "main/dist/update.json"
-)
-UPDATE_PACKAGE_URL = (
-    "https://raw.githubusercontent.com/FennecMomo/DesktopTools/"
-    "main/dist/DesktopTools.exe"
-)
-MAX_UPDATE_BYTES = 100 * 1024 * 1024
-SINGLE_INSTANCE_MUTEX_NAME = "Local\\FennecMomo.DesktopTools.Singleton.v1"
-SECOND_INSTANCE_MESSAGE_NAME = "FennecMomo.DesktopTools.SecondInstance.v1"
+APP_VERSION = "2.3.1"
 
 WINDOW_WIDTH = 560
-WINDOW_HEIGHT = 320
+WINDOW_HEIGHT = 360
 MIN_WIDTH = 380
 MIN_HEIGHT = 280
 TITLE_HEIGHT = 48
@@ -53,14 +129,11 @@ BALL_SIZE = 58
 BALL_MARGIN = 6
 SHORTCUT_ICON_SIZE = 46
 SHORTCUT_ICON_GAP = 6
-RESTORE_MARGIN = 10
 EDGE_TRIGGER_DISTANCE = 28
 ANIMATION_STEPS = 10
 ANIMATION_DELAY_MS = 14
 HOVER_POLL_MS = 90
 HOVER_MARGIN = 16
-WINDOW_MODES = ("便签", "待办", "任务胶囊", "倒计时", "时钟", "快捷按键", "浏览器")
-DEFAULT_BROWSER_URL = "https://www.bing.com/"
 BROWSER_MIN_WIDTH = 760
 BROWSER_MIN_HEIGHT = 520
 MODE_HINTS = {
@@ -73,865 +146,13 @@ MODE_HINTS = {
     "浏览器": "在自由窗口中浏览网页",
 }
 
-BG_OUTER = "#11141A"
-BG_TITLE = "#20242D"
-BG_BODY = "#292E39"
-BG_PANEL = "#222730"
-BORDER = "#4B5262"
-TEXT = "#F5F7FA"
-TEXT_MUTED = "#AAB2C0"
 OUTLINED_TEXT_FILL = "#FFFFFF"
 OUTLINED_TEXT_STROKE = "#000000"
-ACCENT = "#66D9A6"
-ACCENT_HOVER = "#80E5B7"
 LOCKED_ACCENT = "#F5B85C"
 LOCKED_HOVER = "#FFC873"
 CLOSE_HOVER = "#E05260"
 TRANSPARENT_KEY = "#010203"
 
-GWL_EXSTYLE = -20
-WS_EX_TRANSPARENT = 0x00000020
-WS_EX_TOOLWINDOW = 0x00000080
-WS_EX_NOACTIVATE = 0x08000000
-WS_EX_LAYERED = 0x00080000
-LWA_COLORKEY = 0x00000001
-LWA_ALPHA = 0x00000002
-SWP_NOSIZE = 0x0001
-SWP_NOMOVE = 0x0002
-SWP_NOACTIVATE = 0x0010
-SWP_FRAMECHANGED = 0x0020
-MONITOR_DEFAULTTONEAREST = 0x00000002
-
-WM_NULL = 0x0000
-WM_DESTROY = 0x0002
-WM_CONTEXTMENU = 0x007B
-WM_LBUTTONDBLCLK = 0x0203
-WM_RBUTTONUP = 0x0205
-WM_HOTKEY = 0x0312
-WM_APP = 0x8000
-HWND_BROADCAST = 0xFFFF
-ERROR_ALREADY_EXISTS = 183
-TRAY_CALLBACK_MESSAGE = WM_APP + 20
-QUICK_CAPTURE_HOTKEY_ID = 1
-HIDE_HOTKEY_IDS = (2, 3)
-MOD_ALT = 0x0001
-MOD_CONTROL = 0x0002
-MOD_SHIFT = 0x0004
-MOD_NOREPEAT = 0x4000
-GW_OWNER = 4
-SW_RESTORE = 9
-DWMWA_CLOAKED = 14
-
-NIM_ADD = 0x00000000
-NIM_DELETE = 0x00000002
-NIM_MODIFY = 0x00000001
-NIF_MESSAGE = 0x00000001
-NIF_ICON = 0x00000002
-NIF_TIP = 0x00000004
-NIF_INFO = 0x00000010
-NIIF_INFO = 0x00000001
-
-MF_STRING = 0x00000000
-MF_SEPARATOR = 0x00000800
-TPM_RIGHTBUTTON = 0x0002
-TPM_RETURNCMD = 0x0100
-TPM_NONOTIFY = 0x0080
-
-TRAY_COMMAND_ADD = 1001
-TRAY_COMMAND_SETTINGS = 1002
-TRAY_COMMAND_EXIT = 1003
-TRAY_COMMAND_UPDATE = 1004
-TRAY_COMMAND_CAPTURE = 1005
-TRAY_COMMAND_VISIBILITY = 1006
-IDI_APPLICATION = 32512
-MIIM_BITMAP = 0x00000080
-DIB_RGB_COLORS = 0
-BI_RGB = 0
-MENU_ICON_SIZE = 16
-
-
-class Point(ctypes.Structure):
-    _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
-
-
-class Rect(ctypes.Structure):
-    _fields_ = [
-        ("left", wintypes.LONG),
-        ("top", wintypes.LONG),
-        ("right", wintypes.LONG),
-        ("bottom", wintypes.LONG),
-    ]
-
-
-class MonitorInfo(ctypes.Structure):
-    _fields_ = [
-        ("cbSize", wintypes.DWORD),
-        ("rcMonitor", Rect),
-        ("rcWork", Rect),
-        ("dwFlags", wintypes.DWORD),
-    ]
-
-
-class Guid(ctypes.Structure):
-    _fields_ = [
-        ("Data1", wintypes.DWORD),
-        ("Data2", wintypes.WORD),
-        ("Data3", wintypes.WORD),
-        ("Data4", ctypes.c_ubyte * 8),
-    ]
-
-
-class NotifyIconData(ctypes.Structure):
-    _fields_ = [
-        ("cbSize", wintypes.DWORD),
-        ("hWnd", wintypes.HWND),
-        ("uID", wintypes.UINT),
-        ("uFlags", wintypes.UINT),
-        ("uCallbackMessage", wintypes.UINT),
-        ("hIcon", wintypes.HICON),
-        ("szTip", wintypes.WCHAR * 128),
-        ("dwState", wintypes.DWORD),
-        ("dwStateMask", wintypes.DWORD),
-        ("szInfo", wintypes.WCHAR * 256),
-        ("uTimeoutOrVersion", wintypes.UINT),
-        ("szInfoTitle", wintypes.WCHAR * 64),
-        ("dwInfoFlags", wintypes.DWORD),
-        ("guidItem", Guid),
-        ("hBalloonIcon", wintypes.HICON),
-    ]
-
-
-class BitmapInfoHeader(ctypes.Structure):
-    _fields_ = [
-        ("biSize", wintypes.DWORD),
-        ("biWidth", wintypes.LONG),
-        ("biHeight", wintypes.LONG),
-        ("biPlanes", wintypes.WORD),
-        ("biBitCount", wintypes.WORD),
-        ("biCompression", wintypes.DWORD),
-        ("biSizeImage", wintypes.DWORD),
-        ("biXPelsPerMeter", wintypes.LONG),
-        ("biYPelsPerMeter", wintypes.LONG),
-        ("biClrUsed", wintypes.DWORD),
-        ("biClrImportant", wintypes.DWORD),
-    ]
-
-
-class RgbQuad(ctypes.Structure):
-    _fields_ = [
-        ("rgbBlue", ctypes.c_ubyte),
-        ("rgbGreen", ctypes.c_ubyte),
-        ("rgbRed", ctypes.c_ubyte),
-        ("rgbReserved", ctypes.c_ubyte),
-    ]
-
-
-class BitmapInfo(ctypes.Structure):
-    _fields_ = [
-        ("bmiHeader", BitmapInfoHeader),
-        ("bmiColors", RgbQuad * 1),
-    ]
-
-
-class MenuItemInfo(ctypes.Structure):
-    _fields_ = [
-        ("cbSize", wintypes.UINT),
-        ("fMask", wintypes.UINT),
-        ("fType", wintypes.UINT),
-        ("fState", wintypes.UINT),
-        ("wID", wintypes.UINT),
-        ("hSubMenu", wintypes.HMENU),
-        ("hbmpChecked", wintypes.HBITMAP),
-        ("hbmpUnchecked", wintypes.HBITMAP),
-        ("dwItemData", ctypes.c_size_t),
-        ("dwTypeData", wintypes.LPWSTR),
-        ("cch", wintypes.UINT),
-        ("hbmpItem", wintypes.HBITMAP),
-    ]
-
-
-WindowProcedure = ctypes.WINFUNCTYPE(
-    ctypes.c_ssize_t,
-    wintypes.HWND,
-    wintypes.UINT,
-    wintypes.WPARAM,
-    wintypes.LPARAM,
-)
-
-EnumWindowsCallback = ctypes.WINFUNCTYPE(
-    wintypes.BOOL,
-    wintypes.HWND,
-    wintypes.LPARAM,
-)
-
-
-class WindowClassEx(ctypes.Structure):
-    _fields_ = [
-        ("cbSize", wintypes.UINT),
-        ("style", wintypes.UINT),
-        ("lpfnWndProc", WindowProcedure),
-        ("cbClsExtra", ctypes.c_int),
-        ("cbWndExtra", ctypes.c_int),
-        ("hInstance", wintypes.HINSTANCE),
-        ("hIcon", wintypes.HICON),
-        ("hCursor", wintypes.HANDLE),
-        ("hbrBackground", wintypes.HANDLE),
-        ("lpszMenuName", wintypes.LPCWSTR),
-        ("lpszClassName", wintypes.LPCWSTR),
-        ("hIconSm", wintypes.HICON),
-    ]
-
-
-def _enable_dpi_awareness() -> None:
-    """Keep geometry and text crisp on scaled Windows displays."""
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)
-    except (AttributeError, OSError):
-        try:
-            ctypes.windll.user32.SetProcessDPIAware()
-        except (AttributeError, OSError):
-            pass
-
-
-_enable_dpi_awareness()
-
-user32 = ctypes.WinDLL("user32", use_last_error=True)
-shell32 = ctypes.WinDLL("shell32", use_last_error=True)
-kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
-dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
-_pointer_bits = ctypes.sizeof(ctypes.c_void_p) * 8
-
-if _pointer_bits == 64:
-    _get_window_long = user32.GetWindowLongPtrW
-    _set_window_long = user32.SetWindowLongPtrW
-else:
-    _get_window_long = user32.GetWindowLongW
-    _set_window_long = user32.SetWindowLongW
-
-_get_window_long.argtypes = [wintypes.HWND, ctypes.c_int]
-_get_window_long.restype = ctypes.c_ssize_t
-_set_window_long.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
-_set_window_long.restype = ctypes.c_ssize_t
-
-user32.GetParent.argtypes = [wintypes.HWND]
-user32.GetParent.restype = wintypes.HWND
-user32.SetWindowPos.argtypes = [
-    wintypes.HWND,
-    wintypes.HWND,
-    ctypes.c_int,
-    ctypes.c_int,
-    ctypes.c_int,
-    ctypes.c_int,
-    wintypes.UINT,
-]
-user32.SetWindowPos.restype = wintypes.BOOL
-user32.MonitorFromPoint.argtypes = [Point, wintypes.DWORD]
-user32.MonitorFromPoint.restype = wintypes.HANDLE
-user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MonitorInfo)]
-user32.GetMonitorInfoW.restype = wintypes.BOOL
-user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(Rect)]
-user32.GetWindowRect.restype = wintypes.BOOL
-user32.SetLayeredWindowAttributes.argtypes = [
-    wintypes.HWND,
-    wintypes.DWORD,
-    ctypes.c_ubyte,
-    wintypes.DWORD,
-]
-user32.SetLayeredWindowAttributes.restype = wintypes.BOOL
-user32.GetLayeredWindowAttributes.argtypes = [
-    wintypes.HWND,
-    ctypes.POINTER(wintypes.DWORD),
-    ctypes.POINTER(ctypes.c_ubyte),
-    ctypes.POINTER(wintypes.DWORD),
-]
-user32.GetLayeredWindowAttributes.restype = wintypes.BOOL
-user32.RegisterClassExW.argtypes = [ctypes.POINTER(WindowClassEx)]
-user32.RegisterClassExW.restype = wintypes.ATOM
-user32.CreateWindowExW.argtypes = [
-    wintypes.DWORD,
-    wintypes.LPCWSTR,
-    wintypes.LPCWSTR,
-    wintypes.DWORD,
-    ctypes.c_int,
-    ctypes.c_int,
-    ctypes.c_int,
-    ctypes.c_int,
-    wintypes.HWND,
-    wintypes.HMENU,
-    wintypes.HINSTANCE,
-    wintypes.LPVOID,
-]
-user32.CreateWindowExW.restype = wintypes.HWND
-user32.DefWindowProcW.argtypes = [
-    wintypes.HWND,
-    wintypes.UINT,
-    wintypes.WPARAM,
-    wintypes.LPARAM,
-]
-user32.DefWindowProcW.restype = ctypes.c_ssize_t
-user32.DestroyWindow.argtypes = [wintypes.HWND]
-user32.DestroyWindow.restype = wintypes.BOOL
-user32.UnregisterClassW.argtypes = [wintypes.LPCWSTR, wintypes.HINSTANCE]
-user32.UnregisterClassW.restype = wintypes.BOOL
-user32.LoadIconW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR]
-user32.LoadIconW.restype = wintypes.HICON
-user32.CreatePopupMenu.restype = wintypes.HMENU
-user32.AppendMenuW.argtypes = [
-    wintypes.HMENU,
-    wintypes.UINT,
-    ctypes.c_size_t,
-    wintypes.LPCWSTR,
-]
-user32.AppendMenuW.restype = wintypes.BOOL
-user32.TrackPopupMenu.argtypes = [
-    wintypes.HMENU,
-    wintypes.UINT,
-    ctypes.c_int,
-    ctypes.c_int,
-    ctypes.c_int,
-    wintypes.HWND,
-    wintypes.LPVOID,
-]
-user32.TrackPopupMenu.restype = wintypes.UINT
-user32.DestroyMenu.argtypes = [wintypes.HMENU]
-user32.DestroyMenu.restype = wintypes.BOOL
-user32.SetForegroundWindow.argtypes = [wintypes.HWND]
-user32.SetForegroundWindow.restype = wintypes.BOOL
-user32.PostMessageW.argtypes = [
-    wintypes.HWND,
-    wintypes.UINT,
-    wintypes.WPARAM,
-    wintypes.LPARAM,
-]
-user32.PostMessageW.restype = wintypes.BOOL
-user32.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
-user32.RegisterWindowMessageW.restype = wintypes.UINT
-user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
-user32.RegisterHotKey.restype = wintypes.BOOL
-user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
-user32.UnregisterHotKey.restype = wintypes.BOOL
-user32.GetCursorPos.argtypes = [ctypes.POINTER(Point)]
-user32.GetCursorPos.restype = wintypes.BOOL
-user32.EnumWindows.argtypes = [EnumWindowsCallback, wintypes.LPARAM]
-user32.EnumWindows.restype = wintypes.BOOL
-user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
-user32.GetWindow.restype = wintypes.HWND
-user32.GetWindowThreadProcessId.argtypes = [
-    wintypes.HWND,
-    ctypes.POINTER(wintypes.DWORD),
-]
-user32.GetWindowThreadProcessId.restype = wintypes.DWORD
-user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-user32.GetClassNameW.restype = ctypes.c_int
-user32.IsIconic.argtypes = [wintypes.HWND]
-user32.IsIconic.restype = wintypes.BOOL
-user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
-user32.ShowWindow.restype = wintypes.BOOL
-user32.SetMenuItemInfoW.argtypes = [
-    wintypes.HMENU,
-    wintypes.UINT,
-    wintypes.BOOL,
-    ctypes.POINTER(MenuItemInfo),
-]
-user32.SetMenuItemInfoW.restype = wintypes.BOOL
-
-kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
-kernel32.GetModuleHandleW.restype = wintypes.HINSTANCE
-kernel32.GetCurrentProcessId.argtypes = []
-kernel32.GetCurrentProcessId.restype = wintypes.DWORD
-kernel32.CreateMutexW.argtypes = [
-    wintypes.LPVOID,
-    wintypes.BOOL,
-    wintypes.LPCWSTR,
-]
-kernel32.CreateMutexW.restype = wintypes.HANDLE
-kernel32.ReleaseMutex.argtypes = [wintypes.HANDLE]
-kernel32.ReleaseMutex.restype = wintypes.BOOL
-kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-kernel32.CloseHandle.restype = wintypes.BOOL
-shell32.Shell_NotifyIconW.argtypes = [
-    wintypes.DWORD,
-    ctypes.POINTER(NotifyIconData),
-]
-shell32.Shell_NotifyIconW.restype = wintypes.BOOL
-gdi32.CreateDIBSection.argtypes = [
-    wintypes.HDC,
-    ctypes.POINTER(BitmapInfo),
-    wintypes.UINT,
-    ctypes.POINTER(ctypes.c_void_p),
-    wintypes.HANDLE,
-    wintypes.DWORD,
-]
-gdi32.CreateDIBSection.restype = wintypes.HBITMAP
-gdi32.DeleteObject.argtypes = [wintypes.HANDLE]
-gdi32.DeleteObject.restype = wintypes.BOOL
-
-dwmapi.DwmGetWindowAttribute.argtypes = [
-    wintypes.HWND,
-    wintypes.DWORD,
-    ctypes.c_void_p,
-    wintypes.DWORD,
-]
-dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long
-
-HWND_TOPMOST = wintypes.HWND(-1)
-
-
-def _top_level_handle(window: tk.Misc) -> int:
-    """Return the native wrapper HWND used by Tk on Windows."""
-    window.update_idletasks()
-    child_handle = int(window.winfo_id())
-    parent_handle = user32.GetParent(wintypes.HWND(child_handle))
-    return int(parent_handle or child_handle)
-
-
-def _set_native_topmost(window: tk.Misc) -> None:
-    hwnd = _top_level_handle(window)
-    user32.SetWindowPos(
-        wintypes.HWND(hwnd),
-        HWND_TOPMOST,
-        0,
-        0,
-        0,
-        0,
-        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-    )
-
-
-def _set_absolute_geometry(
-    window: tk.Misc,
-    *,
-    width: int | None = None,
-    height: int | None = None,
-    x: int | None = None,
-    y: int | None = None,
-) -> None:
-    """Move/resize a Tk window using absolute virtual-screen coordinates.
-
-    Tk treats negative geometry coordinates as offsets from the right or bottom
-    edge. SetWindowPos avoids that behavior and supports monitors placed to the
-    left or above the primary display.
-    """
-    move_window = x is not None and y is not None
-    resize_window = width is not None and height is not None
-    flags = SWP_NOACTIVATE
-    if not move_window:
-        flags |= SWP_NOMOVE
-    if not resize_window:
-        flags |= SWP_NOSIZE
-
-    hwnd = _top_level_handle(window)
-    success = user32.SetWindowPos(
-        wintypes.HWND(hwnd),
-        HWND_TOPMOST,
-        int(x or 0),
-        int(y or 0),
-        int(width or 0),
-        int(height or 0),
-        flags,
-    )
-    if not success:
-        raise ctypes.WinError(ctypes.get_last_error())
-
-
-def _native_window_geometry(window: tk.Misc) -> tuple[int, int, int, int]:
-    """Read the actual window rectangle, including withdrawn Tk windows."""
-    rectangle = Rect()
-    if not user32.GetWindowRect(
-        wintypes.HWND(_top_level_handle(window)),
-        ctypes.byref(rectangle),
-    ):
-        raise ctypes.WinError(ctypes.get_last_error())
-    return (
-        rectangle.right - rectangle.left,
-        rectangle.bottom - rectangle.top,
-        rectangle.left,
-        rectangle.top,
-    )
-
-
-def _is_cloaked_window(hwnd: int) -> bool:
-    """Hide windows that belong to other virtual desktops or suspended UWP apps."""
-    cloaked = wintypes.DWORD()
-    result = dwmapi.DwmGetWindowAttribute(
-        wintypes.HWND(hwnd),
-        DWMWA_CLOAKED,
-        ctypes.byref(cloaked),
-        ctypes.sizeof(cloaked),
-    )
-    return result == 0 and cloaked.value != 0
-
-
-def _switch_candidates() -> list[int]:
-    """List switchable windows in Alt+Tab-like z-order, excluding this process."""
-    own_process = kernel32.GetCurrentProcessId()
-    candidates: list[int] = []
-
-    def collect(hwnd: int, _lparam: int) -> bool:
-        if not user32.IsWindowVisible(hwnd):
-            return True
-        if user32.GetWindow(hwnd, GW_OWNER):
-            return True
-        if int(_get_window_long(wintypes.HWND(hwnd), GWL_EXSTYLE)) & WS_EX_TOOLWINDOW:
-            return True
-        process_id = wintypes.DWORD()
-        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
-        if process_id.value == own_process:
-            return True
-        class_name = ctypes.create_unicode_buffer(64)
-        user32.GetClassNameW(hwnd, class_name, 64)
-        if class_name.value in (
-            "Progman",
-            "WorkerW",
-            "Shell_TrayWnd",
-            "Shell_SecondaryTrayWnd",
-        ):
-            return True
-        if _is_cloaked_window(hwnd):
-            return True
-        candidates.append(int(hwnd))
-        return True
-
-    user32.EnumWindows(EnumWindowsCallback(collect), 0)
-    return candidates
-
-
-def _activate_window(hwnd: int) -> bool:
-    handle = wintypes.HWND(hwnd)
-    if user32.IsIconic(handle):
-        user32.ShowWindow(handle, SW_RESTORE)
-    return bool(user32.SetForegroundWindow(handle))
-
-
-def _colorref(color: str) -> int:
-    red = int(color[1:3], 16)
-    green = int(color[3:5], 16)
-    blue = int(color[5:7], 16)
-    return (blue << 16) | (green << 8) | red
-
-
-def _set_layered_attributes(hwnd: int, key: int, alpha: int, flags: int) -> bool:
-    """Combine uniform alpha and a background color key on one layered window.
-
-    Tk's -alpha and -transparentcolor attributes each replace the layered
-    window flags, so the two cannot be active at the same time through Tk.
-    Calling SetLayeredWindowAttributes directly keeps both at once.
-    """
-    handle = wintypes.HWND(hwnd)
-    extended_style = int(_get_window_long(handle, GWL_EXSTYLE))
-    if not extended_style & WS_EX_LAYERED:
-        _set_window_long(handle, GWL_EXSTYLE, extended_style | WS_EX_LAYERED)
-    return bool(
-        user32.SetLayeredWindowAttributes(
-            handle,
-            key,
-            _clamp(alpha, 0, 255),
-            flags,
-        )
-    )
-
-
-def _monitor_areas_at(x: int, y: int) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int]]:
-    monitor = user32.MonitorFromPoint(Point(x, y), MONITOR_DEFAULTTONEAREST)
-    info = MonitorInfo()
-    info.cbSize = ctypes.sizeof(MonitorInfo)
-    if not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
-        raise ctypes.WinError(ctypes.get_last_error())
-
-    monitor_area = (
-        info.rcMonitor.left,
-        info.rcMonitor.top,
-        info.rcMonitor.right,
-        info.rcMonitor.bottom,
-    )
-    work_area = (
-        info.rcWork.left,
-        info.rcWork.top,
-        info.rcWork.right,
-        info.rcWork.bottom,
-    )
-    return monitor_area, work_area
-
-
-def _clamp(value: int, minimum: int, maximum: int) -> int:
-    return max(minimum, min(value, max(minimum, maximum)))
-
-
-def _default_settings_path() -> Path:
-    local_app_data = os.environ.get("LOCALAPPDATA")
-    if local_app_data:
-        return Path(local_app_data) / "DesktopTools" / "settings.json"
-    return Path.home() / "AppData" / "Local" / "DesktopTools" / "settings.json"
-
-
-def _browser_destination(address: str) -> str:
-    value = address.strip()
-    if not value:
-        return DEFAULT_BROWSER_URL
-    if len(value) > 8192:
-        raise ValueError("网址过长")
-    if any(character.isspace() for character in value):
-        return "https://www.bing.com/search?q=" + urllib.parse.quote_plus(value)
-    if "://" not in value:
-        if ":" in value and "." not in value.split(":", 1)[0] and not value.startswith("localhost:"):
-            raise ValueError("仅支持 http:// 或 https:// 网页")
-        if "." not in value and not value.startswith("localhost:"):
-            return "https://www.bing.com/search?q=" + urllib.parse.quote_plus(value)
-        scheme = "http://" if value.startswith(("localhost:", "127.0.0.1:")) else "https://"
-        value = scheme + value
-    parsed = urllib.parse.urlsplit(value)
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        raise ValueError("仅支持有效的 http:// 或 https:// 网址")
-    return value
-
-
-def _parse_hide_hotkey(value: str) -> tuple[str, int, int]:
-    if not isinstance(value, str):
-        raise ValueError("请输入快捷键组合，例如 Ctrl+K")
-    parts = [part.strip().lower() for part in value.split("+")]
-    if len(parts) < 2 or any(not part for part in parts):
-        raise ValueError("请输入快捷键组合，例如 Ctrl+K")
-    aliases = {"control": "ctrl"}
-    names = {
-        "ctrl": ("Ctrl", MOD_CONTROL),
-        "alt": ("Alt", MOD_ALT),
-        "shift": ("Shift", MOD_SHIFT),
-    }
-    modifiers = 0
-    seen: set[str] = set()
-    for part in parts[:-1]:
-        name = aliases.get(part, part)
-        if name not in names or name in seen:
-            raise ValueError("修饰键仅支持 Ctrl、Alt、Shift，且不能重复")
-        seen.add(name)
-        modifiers |= names[name][1]
-    if not modifiers & (MOD_CONTROL | MOD_ALT):
-        raise ValueError("快捷隐藏至少需要 Ctrl 或 Alt")
-    key_name = parts[-1].upper()
-    if len(key_name) == 1 and key_name in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789":
-        virtual_key = ord(key_name)
-    elif key_name.startswith("F") and key_name[1:].isdigit() and 1 <= int(key_name[1:]) <= 12:
-        number = int(key_name[1:])
-        key_name = f"F{number}"
-        virtual_key = 0x70 + number - 1
-    else:
-        raise ValueError("主键只支持 A–Z、0–9 或 F1–F12")
-    if modifiers == (MOD_CONTROL | MOD_ALT) and key_name == "D":
-        raise ValueError("Ctrl+Alt+D 已用于快速收集")
-    label = "+".join(names[name][0] for name in ("ctrl", "alt", "shift") if name in seen)
-    return f"{label}+{key_name}", modifiers, virtual_key
-
-
-class SingleInstanceGuard:
-    """Own a named Windows mutex for the lifetime of the main app process."""
-
-    def __init__(self, name: str = SINGLE_INSTANCE_MUTEX_NAME) -> None:
-        self.name = name
-        self._handle: int | None = None
-
-    @property
-    def acquired(self) -> bool:
-        return self._handle is not None
-
-    def acquire(self) -> bool:
-        if self._handle is not None:
-            return True
-        ctypes.set_last_error(0)
-        handle = kernel32.CreateMutexW(None, True, self.name)
-        if not handle:
-            raise ctypes.WinError(ctypes.get_last_error())
-        if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
-            kernel32.CloseHandle(handle)
-            return False
-        self._handle = handle
-        return True
-
-    def close(self) -> None:
-        if self._handle is None:
-            return
-        kernel32.ReleaseMutex(self._handle)
-        kernel32.CloseHandle(self._handle)
-        self._handle = None
-
-
-def _signal_existing_instance() -> bool:
-    message = user32.RegisterWindowMessageW(SECOND_INSTANCE_MESSAGE_NAME)
-    return bool(
-        message and user32.PostMessageW(HWND_BROADCAST, message, 0, 0)
-    )
-
-
-class SettingsStore:
-    DEFAULTS = {
-        "opacity_percent": 86,
-        "edge_collapse_enabled": True,
-        "restore_margin": RESTORE_MARGIN,
-        "no_background": False,
-        "auto_update": False,
-        "hide_hotkey": "Ctrl+K",
-    }
-
-    def __init__(self, path: Path | None = None) -> None:
-        self.path = Path(path) if path is not None else _default_settings_path()
-
-    def load(self) -> dict[str, int | bool | str]:
-        try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            raw = {}
-        if not isinstance(raw, dict):
-            raw = {}
-
-        opacity = raw.get("opacity_percent")
-        if isinstance(opacity, bool) or not isinstance(opacity, (int, float)):
-            opacity = self.DEFAULTS["opacity_percent"]
-
-        edge_collapse = raw.get("edge_collapse_enabled")
-        if not isinstance(edge_collapse, bool):
-            edge_collapse = self.DEFAULTS["edge_collapse_enabled"]
-
-        restore_margin = raw.get("restore_margin")
-        if isinstance(restore_margin, bool) or not isinstance(
-            restore_margin,
-            (int, float),
-        ):
-            restore_margin = self.DEFAULTS["restore_margin"]
-
-        no_background = raw.get("no_background")
-        if not isinstance(no_background, bool):
-            no_background = self.DEFAULTS["no_background"]
-
-        auto_update = raw.get("auto_update")
-        if not isinstance(auto_update, bool):
-            auto_update = self.DEFAULTS["auto_update"]
-
-        try:
-            hide_hotkey = _parse_hide_hotkey(raw.get("hide_hotkey"))[0]
-        except ValueError:
-            hide_hotkey = self.DEFAULTS["hide_hotkey"]
-
-        return {
-            "opacity_percent": _clamp(round(opacity), 55, 100),
-            "edge_collapse_enabled": edge_collapse,
-            "restore_margin": _clamp(round(restore_margin), 0, 80),
-            "no_background": no_background,
-            "auto_update": auto_update,
-            "hide_hotkey": hide_hotkey,
-        }
-
-    def save(self, settings: dict[str, int | bool | str]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "version": 1,
-            "opacity_percent": _clamp(int(settings["opacity_percent"]), 55, 100),
-            "edge_collapse_enabled": bool(settings["edge_collapse_enabled"]),
-            "restore_margin": _clamp(int(settings["restore_margin"]), 0, 80),
-            "no_background": bool(settings["no_background"]),
-            "auto_update": bool(settings["auto_update"]),
-            "hide_hotkey": _parse_hide_hotkey(settings["hide_hotkey"])[0],
-        }
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix="settings-",
-            suffix=".tmp",
-            dir=self.path.parent,
-        )
-        temporary_path = Path(temporary_name)
-        try:
-            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as file:
-                json.dump(payload, file, ensure_ascii=False, indent=2)
-                file.write("\n")
-                file.flush()
-                os.fsync(file.fileno())
-            os.replace(temporary_path, self.path)
-        except BaseException:
-            try:
-                temporary_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise
-
-
-class TaskState:
-    """Content and timers shared by every window bound to one task number."""
-
-    def __init__(self, task_id: int) -> None:
-        self.id = task_id
-        self.note = ""
-        self.todos: list[tuple[str, bool, float | None, float | None]] = []
-        self.focus_task_index: int | None = None
-        self.focus_status = "ready"
-        self.focus_remaining_seconds: float = 25 * 60
-        self.focus_deadline: float | None = None
-        self.timer_minutes = 25
-        self.timer_remaining_seconds: float = 25 * 60
-        self.timer_deadline: float | None = None
-        self.timer_status = "ready"
-
-    @classmethod
-    def from_record(cls, task_id: int, record: dict[str, object]) -> "TaskState":
-        task = cls(task_id)
-        task.note = record.get("note") if isinstance(record.get("note"), str) else ""
-        raw_todos = record.get("todos")
-        if isinstance(raw_todos, list):
-            task.todos = [
-                (
-                    item["text"],
-                    item["done"],
-                    item.get("due")
-                    if type(item.get("due")) in (int, float)
-                    and math.isfinite(item.get("due"))
-                    else None,
-                    item.get("created")
-                    if type(item.get("created")) in (int, float)
-                    and math.isfinite(item.get("created"))
-                    else None,
-                )
-                for item in raw_todos
-                if isinstance(item, dict)
-                and isinstance(item.get("text"), str)
-                and isinstance(item.get("done"), bool)
-            ]
-        minutes = record.get("timer_minutes")
-        if type(minutes) is int:
-            task.timer_minutes = _clamp(minutes, 1, 180)
-        task.timer_remaining_seconds = task.timer_minutes * 60
-        focus_index = record.get("focus_task_index")
-        if type(focus_index) is int and 0 <= focus_index < len(task.todos):
-            task.focus_task_index = focus_index
-            status = record.get("focus_status")
-            if status in ("running", "paused", "finished"):
-                task.focus_status = "paused" if status == "running" else status
-        remaining = record.get("focus_remaining_seconds")
-        if type(remaining) in (int, float) and math.isfinite(remaining):
-            task.focus_remaining_seconds = _clamp(round(remaining), 0, 180 * 60)
-        else:
-            task.focus_remaining_seconds = task.timer_minutes * 60
-        return task
-
-    def snapshot(self) -> dict[str, object]:
-        return {
-            "id": self.id,
-            "note": self.note,
-            "todos": [
-                {
-                    "text": title,
-                    "done": done,
-                    "due": due,
-                    "created": created,
-                }
-                for title, done, due, created in self.todos
-            ],
-            "focus_task_index": self.focus_task_index,
-            "focus_status": self.focus_status,
-            "focus_remaining_seconds": (
-                max(0, math.ceil(self.focus_deadline - time.monotonic()))
-                if self.focus_deadline is not None
-                else max(0, math.ceil(self.focus_remaining_seconds))
-            ),
-            "timer_minutes": self.timer_minutes,
-            "timer_status": self.timer_status,
-        }
 
 
 FOCUS_STATUS_TEXT = {
@@ -1327,172 +548,6 @@ def _prompt_todo_due(
     return result[0]
 
 
-class WindowStateStore:
-    """Persist window presentation separately from shared task content."""
-
-    def __init__(self, path: Path | None = None) -> None:
-        self.path = Path(path) if path is not None else _default_settings_path().with_name(
-            "windows.json"
-        )
-
-    def load(self) -> list[dict[str, object]]:
-        try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            return []
-        if not isinstance(raw, dict) or not isinstance(raw.get("windows"), list):
-            return []
-
-        windows: list[dict[str, object]] = []
-        has_tasks = isinstance(raw.get("tasks"), list)
-        seen_ids: set[int] = set()
-        for item in raw["windows"]:
-            if not isinstance(item, dict):
-                continue
-            number = item.get("id")
-            geometry = item.get("geometry")
-            if (
-                type(number) is not int
-                or number < 1
-                or number in seen_ids
-                or not self._valid_geometry(geometry)
-            ):
-                continue
-            seen_ids.add(number)
-            mode = item.get("mode")
-            task_id = item.get("task_id")
-            if type(task_id) is not int or task_id < 1:
-                task_id = number
-            timer_minutes = item.get("timer_minutes")
-            raw_todos = item.get("todos")
-            todos = []
-            if isinstance(raw_todos, list):
-                for todo in raw_todos:
-                    if (
-                        isinstance(todo, dict)
-                        and isinstance(todo.get("text"), str)
-                        and isinstance(todo.get("done"), bool)
-                    ):
-                        todos.append({"text": todo["text"], "done": todo["done"]})
-            focus_index = item.get("focus_task_index")
-            if type(focus_index) is not int or not 0 <= focus_index < len(todos):
-                focus_index = None
-            focus_status = item.get("focus_status")
-            if focus_status not in ("ready", "running", "paused", "finished"):
-                focus_status = "ready"
-            raw_remaining = item.get("focus_remaining_seconds")
-            default_remaining = (
-                _clamp(timer_minutes, 1, 180) if type(timer_minutes) is int else 25
-            ) * 60
-            focus_remaining = (
-                _clamp(round(raw_remaining), 0, 180 * 60)
-                if type(raw_remaining) in (int, float)
-                and math.isfinite(raw_remaining)
-                else default_remaining
-            )
-            ball_geometry = item.get("ball_geometry")
-            dock_edge = item.get("dock_edge")
-            collapsed = (
-                item.get("collapsed") is True
-                and self._valid_geometry(ball_geometry)
-                and dock_edge in ("left", "right", "top", "bottom")
-            )
-            try:
-                browser_url = _browser_destination(item.get("browser_url", ""))
-            except (TypeError, ValueError):
-                browser_url = DEFAULT_BROWSER_URL
-            window_record = {
-                "id": number,
-                "task_id": task_id,
-                "active": item.get("active") is True,
-                "mode": (
-                    "待办" if not has_tasks and mode == "任务胶囊" and focus_index is None
-                    else mode if mode in WINDOW_MODES else WINDOW_MODES[0]
-                ),
-                "geometry": list(geometry),
-                "collapsed": collapsed,
-                "locked": item.get("locked") is True and not collapsed,
-                "ball_geometry": list(ball_geometry) if collapsed else None,
-                "dock_edge": dock_edge if collapsed else None,
-                "browser_url": browser_url,
-            }
-            if not has_tasks:
-                window_record.update(
-                    {
-                        "note": item["note"] if isinstance(item.get("note"), str) else "",
-                        "todos": todos,
-                        "focus_task_index": focus_index,
-                        "focus_status": focus_status if focus_index is not None else "ready",
-                        "focus_remaining_seconds": focus_remaining,
-                        "timer_minutes": (
-                            _clamp(timer_minutes, 1, 180)
-                            if type(timer_minutes) is int else 25
-                        ),
-                    }
-                )
-            windows.append(window_record)
-        return windows
-
-    def load_tasks(self) -> list[dict[str, object]] | None:
-        try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            return None
-        if not isinstance(raw, dict) or not isinstance(raw.get("tasks"), list):
-            return None
-        tasks: list[dict[str, object]] = []
-        seen_ids: set[int] = set()
-        for item in raw["tasks"]:
-            if not isinstance(item, dict):
-                continue
-            task_id = item.get("id")
-            if type(task_id) is not int or task_id < 1 or task_id in seen_ids:
-                continue
-            seen_ids.add(task_id)
-            tasks.append(TaskState.from_record(task_id, item).snapshot())
-        return tasks
-
-    @staticmethod
-    def _valid_geometry(value: object) -> bool:
-        return (
-            isinstance(value, (list, tuple))
-            and len(value) == 4
-            and all(type(component) is int for component in value)
-            and value[0] > 0
-            and value[1] > 0
-        )
-
-    def save(
-        self,
-        windows: list[dict[str, object]],
-        tasks: list[dict[str, object]],
-    ) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix="windows-",
-            suffix=".tmp",
-            dir=self.path.parent,
-        )
-        temporary_path = Path(temporary_name)
-        try:
-            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as file:
-                json.dump(
-                    {"version": 2, "windows": windows, "tasks": tasks},
-                    file,
-                    ensure_ascii=False,
-                    indent=2,
-                )
-                file.write("\n")
-                file.flush()
-                os.fsync(file.fileno())
-            os.replace(temporary_path, self.path)
-        except BaseException:
-            try:
-                temporary_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise
-
 
 class AutoStartStore:
     """Manage this user's Windows Run entry without requiring administrator rights."""
@@ -1558,189 +613,6 @@ class AutoStartStore:
             stored = self.get_command()
             if stored is not None and stored != self.command():
                 self.set_enabled(True)
-
-
-class UpdateError(Exception):
-    pass
-
-
-def _version_numbers(value: str) -> tuple[int, int, int]:
-    if not isinstance(value, str) or re.fullmatch(r"\d+\.\d+\.\d+", value) is None:
-        raise UpdateError("版本号格式无效")
-    return tuple(int(part) for part in value.split("."))
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as file:
-        for chunk in iter(lambda: file.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-class UpdateClient:
-    """Read the public GitHub package index and verify a staged executable."""
-
-    def __init__(
-        self,
-        directory: Path | None = None,
-        *,
-        manifest_url: str = UPDATE_MANIFEST_URL,
-        package_url: str = UPDATE_PACKAGE_URL,
-        opener: Callable | None = None,
-    ) -> None:
-        self.directory = (
-            Path(directory)
-            if directory is not None
-            else _default_settings_path().parent / "updates"
-        )
-        self.manifest_url = manifest_url
-        self.package_url = package_url
-        self._open = opener or urllib.request.urlopen
-
-    @staticmethod
-    def _request(url: str) -> urllib.request.Request:
-        return urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": f"DesktopTools/{APP_VERSION}",
-                "Cache-Control": "no-cache",
-            },
-        )
-
-    def latest(self) -> dict[str, str | int] | None:
-        try:
-            with self._open(self._request(self.manifest_url), timeout=15) as response:
-                contents = response.read(64 * 1024 + 1)
-        except urllib.error.HTTPError as error:
-            if error.code == 404:
-                return None
-            raise UpdateError(f"GitHub 返回 HTTP {error.code}") from error
-        except (OSError, urllib.error.URLError) as error:
-            raise UpdateError(f"无法连接 GitHub：{error}") from error
-        if len(contents) > 64 * 1024:
-            raise UpdateError("版本索引过大")
-        try:
-            raw = json.loads(contents)
-        except (ValueError, UnicodeError) as error:
-            raise UpdateError("版本索引不是有效 JSON") from error
-        if not isinstance(raw, dict):
-            raise UpdateError("版本索引格式无效")
-        version = raw.get("version")
-        digest = raw.get("sha256")
-        size = raw.get("size")
-        _version_numbers(version)
-        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-fA-F]{64}", digest) is None:
-            raise UpdateError("版本索引缺少有效的 SHA-256")
-        if type(size) is not int or not 0 < size <= MAX_UPDATE_BYTES:
-            raise UpdateError("版本索引包含无效的文件大小")
-        return {"version": version, "sha256": digest.lower(), "size": size}
-
-    def download(self, latest: dict[str, str | int]) -> Path:
-        self.directory.mkdir(parents=True, exist_ok=True)
-        destination = self.directory / (
-            f"DesktopTools-{latest['version']}-{latest['sha256'][:12]}.exe"
-        )
-        if (
-            destination.is_file()
-            and destination.stat().st_size == latest["size"]
-            and _sha256_file(destination) == latest["sha256"]
-        ):
-            return destination
-
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix="download-",
-            suffix=".tmp",
-            dir=self.directory,
-        )
-        temporary_path = Path(temporary_name)
-        try:
-            digest = hashlib.sha256()
-            downloaded = 0
-            try:
-                with os.fdopen(descriptor, "wb") as file:
-                    with self._open(
-                        self._request(self.package_url), timeout=30
-                    ) as response:
-                        while True:
-                            chunk = response.read(1024 * 1024)
-                            if not chunk:
-                                break
-                            if downloaded == 0 and not chunk.startswith(b"MZ"):
-                                raise UpdateError("下载内容不是 Windows EXE")
-                            downloaded += len(chunk)
-                            if downloaded > latest["size"]:
-                                raise UpdateError("下载文件大小与版本索引不符")
-                            digest.update(chunk)
-                            file.write(chunk)
-                    file.flush()
-                    os.fsync(file.fileno())
-            except (OSError, urllib.error.URLError) as error:
-                raise UpdateError(f"下载更新失败：{error}") from error
-            if downloaded != latest["size"] or digest.hexdigest() != latest["sha256"]:
-                raise UpdateError("下载文件校验失败，未安装更新")
-            os.replace(temporary_path, destination)
-            return destination
-        finally:
-            temporary_path.unlink(missing_ok=True)
-
-
-def _apply_staged_update(arguments: list[str]) -> int:
-    """Run from the verified new EXE after the old process has exited."""
-    if (
-        len(arguments) != 3
-        or arguments[2] not in ("restart", "no-restart")
-        or not getattr(sys, "frozen", False)
-    ):
-        return 2
-    target = Path(arguments[0]).resolve()
-    expected_sha256 = arguments[1].lower()
-    restart = arguments[2] == "restart"
-    staged = Path(sys.executable).resolve()
-    try:
-        staged_sha256 = _sha256_file(staged)
-    except OSError:
-        return 3
-    if (
-        target == staged
-        or target.suffix.lower() != ".exe"
-        or re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None
-        or staged_sha256 != expected_sha256
-    ):
-        return 3
-
-    try:
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=".DesktopTools-update-",
-            suffix=".tmp",
-            dir=target.parent,
-        )
-    except OSError:
-        return 4
-    temporary_path = Path(temporary_name)
-    try:
-        with staged.open("rb") as source, os.fdopen(descriptor, "wb") as destination:
-            shutil.copyfileobj(source, destination, length=1024 * 1024)
-            destination.flush()
-            os.fsync(destination.fileno())
-        deadline = time.monotonic() + 120
-        while True:
-            try:
-                os.replace(temporary_path, target)
-                break
-            except OSError as error:
-                if getattr(error, "winerror", None) not in (5, 32, 33):
-                    raise
-                if time.monotonic() >= deadline:
-                    raise
-                time.sleep(0.25)
-        if restart:
-            subprocess.Popen([str(target)], cwd=target.parent)
-        return 0
-    except OSError:
-        return 4
-    finally:
-        temporary_path.unlink(missing_ok=True)
 
 
 def _menu_icon_color(kind: str, x: float, y: float) -> tuple[int, int, int] | None:
@@ -1894,11 +766,13 @@ class SystemTrayIcon:
             SECOND_INSTANCE_MESSAGE_NAME
         )
 
-        icon_resource = ctypes.cast(
-            ctypes.c_void_p(IDI_APPLICATION),
-            wintypes.LPCWSTR,
+        self._icon_handle = user32.LoadImageW(
+            None, str(ICON_PATH), 1,
+            max(16, user32.GetSystemMetrics(49)),
+            max(16, user32.GetSystemMetrics(50)), 0x0010,
         )
-        self._icon_handle = user32.LoadIconW(None, icon_resource)
+        if not self._icon_handle:
+            raise ctypes.WinError(ctypes.get_last_error())
 
         window_class = WindowClassEx()
         window_class.cbSize = ctypes.sizeof(WindowClassEx)
@@ -2171,6 +1045,9 @@ class SystemTrayIcon:
             if bitmap:
                 gdi32.DeleteObject(wintypes.HANDLE(bitmap))
         self._menu_bitmaps.clear()
+        if self._icon_handle:
+            user32.DestroyIcon(self._icon_handle)
+            self._icon_handle = None
 
 
 class OverlayApp:
@@ -2259,6 +1136,7 @@ class OverlayApp:
         self.browser_address = tk.StringVar(master=self.root, value=self.browser_url)
 
         self.root.title(f"{APP_TITLE} #{instance_number}")
+        set_window_icon(self.root)
         self.root.overrideredirect(True)
         self.root.configure(bg=BG_OUTER)
         self.root.attributes("-topmost", True)
@@ -2378,6 +1256,7 @@ class OverlayApp:
                 self.note_text.delete("1.0", "end")
                 self.note_text.insert("1.0", self.task.note)
                 self.note_text.edit_modified(False)
+            self._refresh_note_placeholder()
             expected_todos = tuple(
                 _todo_display_text(item)
                 for item in self.todo_items
@@ -2387,7 +1266,11 @@ class OverlayApp:
                 if self._editing_todo_index is not None:
                     self._cancel_todo_edit()
                 self._render_todos(selected)
-            if self.timer_minutes.get() != self.task.timer_minutes:
+            try:
+                displayed_minutes = self.timer_minutes.get()
+            except (tk.TclError, ValueError):
+                displayed_minutes = None
+            if displayed_minutes != self.task.timer_minutes:
                 self.timer_minutes.set(self.task.timer_minutes)
             self._update_focus_display()
             self._update_timer_display()
@@ -2492,9 +1375,10 @@ class OverlayApp:
         self.title_bar.pack(fill="x", side="top")
         self.title_bar.pack_propagate(False)
 
+        self._brand_image = brand_image(self.root)
         grip = tk.Label(
             self.title_bar,
-            text="⠿",
+            image=self._brand_image,
             bg=BG_TITLE,
             fg=TEXT_MUTED,
             font=("Segoe UI Symbol", 14),
@@ -2594,33 +1478,35 @@ class OverlayApp:
             body,
             bg=BG_PANEL,
             bd=0,
-            highlightbackground="#3B414E",
+            highlightbackground=BORDER,
             highlightthickness=1,
         )
-        panel.pack(fill="both", expand=True, padx=16, pady=16)
+        panel.pack(fill="both", expand=True, padx=12, pady=(8, 12))
 
         self.status_label = tk.Label(
             panel,
             text=f"●  便签 · 任务 #{self.task_id}",
             bg=BG_PANEL,
             fg=ACCENT,
-            font=("Microsoft YaHei UI", 10, "bold"),
+            font=("Microsoft YaHei UI", 12, "bold"),
+            anchor="w",
         )
-        self.status_label.pack(pady=(10, 2))
+        self.status_label.pack(fill="x", padx=16, pady=(12, 2))
 
         self.message_label = tk.Label(
             panel,
             text=MODE_HINTS["便签"],
             bg=BG_PANEL,
-            fg=TEXT,
-            justify="center",
+            fg=TEXT_MUTED,
+            justify="left",
+            anchor="w",
             font=("Microsoft YaHei UI", 9),
             padx=10,
         )
-        self.message_label.pack()
+        self.message_label.pack(fill="x", padx=6)
 
         self.mode_container = tk.Frame(panel, bg=BG_PANEL)
-        self.mode_container.pack(fill="both", expand=True, padx=12, pady=(5, 10))
+        self.mode_container.pack(fill="both", expand=True, padx=14, pady=(12, 14))
 
         self.resize_grip = tk.Label(
             body,
@@ -2648,7 +1534,7 @@ class OverlayApp:
             (body, {"bg": BG_BODY}),
             (
                 panel,
-                {"bg": BG_PANEL, "highlightbackground": "#3B414E"},
+                {"bg": BG_PANEL, "highlightbackground": BORDER},
             ),
             (self.message_label, {"bg": BG_PANEL}),
             (self.resize_grip, {"bg": BG_BODY, "fg": "#717A8C"}),
@@ -2683,6 +1569,15 @@ class OverlayApp:
         **options: str,
     ) -> tk.Widget:
         self._constant_styles.append((widget, options))
+        if isinstance(widget, tk.Button):
+            base = options.get("bg", BG_PANEL)
+            hover = ACCENT_HOVER if base == ACCENT else HOVER
+            widget.configure(activebackground=hover, activeforeground=options.get("fg", TEXT))
+            def hover_color(color):
+                if not self._background_hidden and not self.locked:
+                    widget.configure(bg=color)
+            widget.bind("<Enter>", lambda event: hover_color(hover))
+            widget.bind("<Leave>", lambda event: hover_color(base))
         return widget
 
     def _build_mode_views(self) -> None:
@@ -2705,12 +1600,22 @@ class OverlayApp:
             bd=0,
             highlightthickness=0,
             font=("Microsoft YaHei UI", 11),
+            spacing1=3,
+            spacing3=5,
             padx=8,
             pady=6,
         )
         self.note_text.pack(fill="both", expand=True)
         self._register_mode_style(self.note_text, bg=BG_PANEL)
         self.note_text.bind("<<Modified>>", self._on_note_modified)
+        self.note_placeholder = tk.Label(
+            note_view, text="随手记，随时看\n\n点击这里开始输入，内容会自动保存",
+            bg=BG_PANEL, fg=TEXT_MUTED, font=("Microsoft YaHei UI", 10),
+            justify="center", cursor="xterm",
+        )
+        self.note_placeholder.bind("<Button-1>", lambda event: self.note_text.focus_set())
+        self._register_mode_style(self.note_placeholder, bg=BG_PANEL, fg=TEXT_MUTED)
+        self._refresh_note_placeholder()
 
         todo_view = self.mode_views["待办"]
         self.todo_entry_row = tk.Frame(todo_view, bg=BG_PANEL)
@@ -2726,6 +1631,7 @@ class OverlayApp:
             font=("Microsoft YaHei UI", 10),
         )
         self.todo_input.pack(side="left", fill="x", expand=True, ipady=4)
+        self.todo_input.configure(highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT)
         self.todo_input.bind("<Return>", self._add_todo)
         self._register_mode_style(self.todo_input, bg=BG_BODY, fg=TEXT)
         self.todo_add_button = tk.Button(
@@ -2782,8 +1688,8 @@ class OverlayApp:
             (
                 (
                     ("todo_toggle_button", "完成 / 撤销", self._toggle_todo),
-                    ("todo_edit_button", "编辑选中", self._edit_todo),
-                    ("todo_delete_button", "删除选中", self._delete_todo),
+                    ("todo_edit_button", "编辑", self._edit_todo),
+                    ("todo_delete_button", "删除", self._delete_todo),
                 ),
                 (
                     ("todo_due_button", "设置截止", self._request_todo_due),
@@ -2811,6 +1717,8 @@ class OverlayApp:
                 button.pack(side="left", padx=(0, 8))
                 self._register_mode_style(button, bg=BG_BODY, fg=TEXT_MUTED)
         self.todo_list.pack(fill="both", expand=True)
+        self.todo_focus_button.configure(bg=ACCENT, fg="#123D32")
+        self._register_mode_style(self.todo_focus_button, bg=ACCENT, fg="#123D32")
 
         self.timer_minutes = tk.IntVar(master=self.root, value=25)
         focus_view = self.mode_views["任务胶囊"]
@@ -2849,7 +1757,7 @@ class OverlayApp:
             text="25:00",
             bg=BG_PANEL,
             fg=TEXT,
-            font=("Segoe UI", 28, "bold"),
+            font=("Segoe UI", 36),
         )
         self._register_mode_style(self.focus_time_label, bg=BG_PANEL, fg=TEXT)
         self.focus_actions = tk.Frame(focus_view, bg=BG_PANEL)
@@ -2884,7 +1792,7 @@ class OverlayApp:
             text="25:00",
             bg=BG_PANEL,
             fg=TEXT,
-            font=("Segoe UI", 30, "bold"),
+            font=("Segoe UI", 38),
         )
         self.timer_label.pack(expand=True)
         self._register_mode_style(self.timer_label, bg=BG_PANEL)
@@ -2952,7 +1860,7 @@ class OverlayApp:
             clock_view,
             bg=BG_PANEL,
             fg=TEXT,
-            font=("Segoe UI", 30, "bold"),
+            font=("Segoe UI", 38),
         )
         self.clock_time_label.pack(expand=True)
         self._register_mode_style(self.clock_time_label, bg=BG_PANEL)
@@ -3140,8 +2048,8 @@ class OverlayApp:
             self.status_label.pack_forget()
             self.message_label.pack_forget()
         else:
-            self.status_label.pack(pady=(10, 2), before=self.mode_container)
-            self.message_label.pack(before=self.mode_container)
+            self.status_label.pack(fill="x", padx=16, pady=(12, 2), before=self.mode_container)
+            self.message_label.pack(fill="x", padx=6, before=self.mode_container)
         self._refresh_outlined_content()
         if mode == "浏览器":
             if self._browser_first_open:
@@ -3274,8 +2182,17 @@ class OverlayApp:
         if self._syncing_task:
             return
         self.task.note = self.note_text.get("1.0", "end-1c")
+        self._refresh_note_placeholder()
         self._refresh_outlined_content()
         self._notify_state_changed()
+
+    def _refresh_note_placeholder(self) -> None:
+        if not hasattr(self, "note_placeholder"):
+            return
+        if self._background_hidden or self.note_text.get("1.0", "end-1c"):
+            self.note_placeholder.place_forget()
+        else:
+            self.note_placeholder.place(relx=.5, rely=.45, anchor="center")
 
     def _draw_outlined_text(
         self,
@@ -4481,6 +3398,7 @@ class OverlayApp:
         self._sync_lock_window()
 
     def _apply_background_state(self) -> None:
+        self._refresh_note_placeholder()
         if self._background_hidden:
             for widget, options in self._constant_styles:
                 widget.configure(
@@ -4492,7 +3410,7 @@ class OverlayApp:
                 )
             # A transparent foreground still leaves antialiased glyph pixels
             # around the color key. Remove chrome text and widgets entirely.
-            self.drag_grip.configure(text="")
+            self.drag_grip.configure(text="", image="")
             self.title_label.configure(text="")
             self.mode_button.configure(text="")
             self.close_button.configure(text="")
@@ -4506,14 +3424,14 @@ class OverlayApp:
         else:
             for widget, options in self._constant_styles:
                 widget.configure(**options)
-            self.drag_grip.configure(text="⠿")
+            self.drag_grip.configure(text="", image=self._brand_image)
             self.title_label.configure(text=f"自由窗口 #{self.instance_number}")
             self.mode_button.configure(text=f"{self.mode} ▾")
             self.close_button.configure(text="×")
             self.resize_grip.configure(text="◢")
             if self.mode != "浏览器":
-                self.status_label.pack(pady=(10, 2), before=self.mode_container)
-                self.message_label.pack(before=self.mode_container)
+                self.status_label.pack(fill="x", padx=16, pady=(12, 2), before=self.mode_container)
+                self.message_label.pack(fill="x", padx=6, before=self.mode_container)
             self.todo_entry_row.pack(
                 fill="x",
                 pady=(0, 5),
@@ -4765,10 +3683,12 @@ class DesktopManager:
         self.root = tk.Tk()
         self.root.withdraw()
         self.root.title(APP_TITLE)
+        set_window_icon(self.root)
         self.root.protocol("WM_DELETE_WINDOW", self.exit_app)
 
         self.settings_store = SettingsStore(settings_path)
-        self.update_client = update_client or UpdateClient()
+        self.root.report_callback_exception = report_callback_exception
+        self.update_client = update_client or UpdateClient(app_version=APP_VERSION)
         self.auto_start_store = auto_start_store or AutoStartStore()
         try:
             self.auto_start_store.refresh_frozen_path()
@@ -4884,6 +3804,22 @@ class DesktopManager:
         self._hover_after_id = self.root.after(HOVER_POLL_MS, self._poll_hover)
         if self.auto_update.get() and getattr(sys, "frozen", False):
             self.root.after(1500, lambda: self.check_for_updates(manual=False))
+        if self.window_store.load_warning or self.settings_store.load_warning:
+            self.root.after_idle(self._show_recovery_notice)
+
+    def _show_recovery_notice(self) -> None:
+        if self._exiting:
+            return
+        warning = "\n".join(
+            store.load_warning for store in (self.window_store, self.settings_store)
+            if store.load_warning
+        )
+        if not warning:
+            return
+        self.tray.notify("存档需要恢复", "原文件已受到保护，请在设置的“更新与存档”查看恢复详情。")
+        if self.visible:
+            self.open_settings()
+            messagebox.showwarning("DesktopTools 存档恢复", warning, parent=self.settings_window)
 
     def _handle_second_launch(self) -> None:
         if self._exiting:
@@ -5038,7 +3974,16 @@ class DesktopManager:
         if window not in self.windows:
             return
         task = self._tasks.setdefault(task_id, TaskState(task_id))
+        previous_task = window.task
         window.bind_task(task)
+        self._pause_unbound_task(previous_task)
+
+    def _pause_unbound_task(self, task: TaskState) -> None:
+        if any(peer.task is task for peer in self.windows):
+            return
+        task.pause_timers()
+        self._task_snapshots[task.id] = task.snapshot()
+        self._schedule_window_states_save()
 
     def _task_summaries(self) -> list[TaskState]:
         return [task for _task_id, task in sorted(self._tasks.items())]
@@ -5050,6 +3995,7 @@ class DesktopManager:
         task_snapshot = window.task.snapshot()
         previous_task = self._task_snapshots.get(window.task_id)
         task_changed = previous_task != task_snapshot
+        visual_changed = False
         if task_changed:
             self._task_snapshots[window.task_id] = task_snapshot
             visual_changed = previous_task is None or any(
@@ -5059,10 +4005,6 @@ class DesktopManager:
                     "timer_minutes", "timer_status",
                 )
             )
-            if visual_changed:
-                for peer in self.windows:
-                    if peer is not window and peer.task is window.task:
-                        peer.refresh_from_task()
         window_changed = True
         for index, record in enumerate(self._window_records):
             if record["id"] == window.instance_number:
@@ -5073,6 +4015,16 @@ class DesktopManager:
             self._window_records.append(snapshot)
         if task_changed or window_changed:
             self._schedule_window_states_save()
+        # Persistence must not depend on any peer successfully rendering.
+        if visual_changed:
+            for peer in tuple(self.windows):
+                if peer is not window and peer.task is window.task:
+                    try:
+                        peer.refresh_from_task()
+                    except Exception:
+                        logging.getLogger("desktoptools").exception(
+                            "Failed to refresh window %s", peer.instance_number
+                        )
 
     def _schedule_window_states_save(self) -> None:
         self._window_state_dirty = True
@@ -5086,7 +4038,7 @@ class DesktopManager:
             self._save_window_states_now,
         )
 
-    def _save_window_states_now(self) -> None:
+    def _save_window_states_now(self) -> bool:
         pending_after = self._window_save_after_id
         self._window_save_after_id = None
         if pending_after is not None:
@@ -5095,7 +4047,7 @@ class DesktopManager:
             except tk.TclError:
                 pass
         if not self._window_state_dirty:
-            return
+            return True
         try:
             self.window_store.save(
                 self._window_records,
@@ -5105,30 +4057,18 @@ class DesktopManager:
             self._window_state_dirty = True
             self._window_save_error = True
             self._update_settings_note()
-            return
+            logging.getLogger("desktoptools").exception("Window state save failed")
+            return False
         self._window_state_dirty = False
         self._window_save_error = False
         self._update_settings_note()
+        return True
 
     def _on_window_closed(self, window: OverlayApp) -> None:
         if window in self.windows:
             self.windows.remove(window)
         if not self._exiting:
-            if not any(peer.task is window.task for peer in self.windows):
-                task = window.task
-                if task.focus_deadline is not None:
-                    task.focus_remaining_seconds = max(
-                        0, task.focus_deadline - time.monotonic()
-                    )
-                    task.focus_deadline = None
-                    task.focus_status = "paused"
-                if task.timer_deadline is not None:
-                    task.timer_remaining_seconds = max(
-                        0, task.timer_deadline - time.monotonic()
-                    )
-                    task.timer_deadline = None
-                    task.timer_status = "paused"
-                self._task_snapshots[task.id] = task.snapshot()
+            self._pause_unbound_task(window.task)
             for index, record in enumerate(self._window_records):
                 if record["id"] == window.instance_number:
                     self._window_records.pop(index)
@@ -5185,6 +4125,7 @@ class DesktopManager:
         if not self.visible:
             window.withdraw()
         window.title("DesktopTools 快速收集")
+        set_window_icon(window)
         window.configure(bg=BG_BODY)
         window.resizable(False, False)
         window.attributes("-topmost", True)
@@ -5320,9 +4261,14 @@ class DesktopManager:
             target.add_todo_text(content)
         else:
             target.append_note_text(content)
-        self._save_window_states_now()
-        self.tray.notify("快速收集已保存", f"已存入自由窗口 #{target.instance_number} 的{mode}")
+        saved = self._save_window_states_now()
+        # The text now belongs to the target task. Clear the capture draft even
+        # on write failure so retrying does not append the same content twice.
         self.close_quick_capture()
+        if saved:
+            self.tray.notify("快速收集已保存", f"已存入自由窗口 #{target.instance_number} 的{mode}")
+        else:
+            self._show_save_failure()
 
     def close_quick_capture(self) -> None:
         if self.quick_capture_window is not None:
@@ -5356,301 +4302,168 @@ class DesktopManager:
         if self.settings_window is not None and self.settings_window.winfo_exists():
             if self.visible:
                 self.settings_window.deiconify()
-                self.settings_window.attributes("-topmost", True)
                 self.settings_window.lift()
                 self.settings_window.focus_force()
             return
-
         window = tk.Toplevel(self.root)
         self.settings_window = window
         if not self.visible:
             window.withdraw()
         window.title("DesktopTools 设置")
+        set_window_icon(window)
         window.configure(bg=BG_BODY)
-        window.resizable(False, False)
+        window.resizable(False, True)
         window.attributes("-topmost", True)
-        try:
-            window.attributes("-toolwindow", True)
-        except tk.TclError:
-            pass
+        window.attributes("-toolwindow", True)
         window.protocol("WM_DELETE_WINDOW", self.close_settings)
 
-        tk.Label(
-            window,
-            text="DesktopTools 设置",
-            bg=BG_BODY,
-            fg=TEXT,
-            font=("Microsoft YaHei UI", 13, "bold"),
-            anchor="w",
-        ).pack(fill="x", padx=22, pady=(10, 3))
+        header = tk.Frame(window, bg=BG_BODY)
+        header.pack(fill="x", padx=24, pady=(20, 16))
+        window._brand = brand_image(window, 48)
+        tk.Label(header, image=window._brand, bg=BG_BODY).pack(side="left", padx=(0, 12))
+        heading = tk.Frame(header, bg=BG_BODY)
+        heading.pack(side="left", fill="x", expand=True)
+        tk.Label(heading, text="DesktopTools", bg=BG_BODY, fg=TEXT,
+                 font=("Segoe UI", 18, "bold"), anchor="w").pack(fill="x")
+        self.instance_count_label = tk.Label(heading, bg=BG_BODY, fg=TEXT_MUTED,
+                                            font=("Microsoft YaHei UI", 9), anchor="w")
+        self.instance_count_label.pack(fill="x")
+        tk.Label(header, text=f"v{APP_VERSION}", bg=BG_PANEL, fg=TEXT_MUTED,
+                 padx=9, pady=4, font=("Segoe UI", 9)).pack(side="right")
 
-        self.instance_count_label = tk.Label(
-            window,
-            text="",
-            bg=BG_BODY,
-            fg=TEXT_MUTED,
-            font=("Microsoft YaHei UI", 9),
-            anchor="w",
-        )
-        self.instance_count_label.pack(fill="x", padx=22, pady=(0, 6))
+        navigation = tk.Frame(window, bg=BG_TITLE)
+        navigation.pack(fill="x", padx=24, pady=(0, 14))
+        footer = tk.Frame(window, bg=BG_BODY)
+        footer.pack(side="bottom", fill="x", padx=24, pady=(12, 18))
+        content = ScrollableFrame(window)
+        self._settings_scroll = content
+        content.pack(fill="both", expand=True, padx=24)
+        self._settings_pages = {}
+        self._settings_tab_buttons = {}
+        def select_page(name):
+            for key, page in self._settings_pages.items():
+                page.pack_forget()
+                self._settings_tab_buttons[key].configure(
+                    bg=ACCENT if key == name else BG_TITLE,
+                    fg="#123D32" if key == name else TEXT_MUTED,
+                )
+            self._settings_pages[name].pack(fill="both", expand=True)
+            content.scroll_to_top()
+        for name in ("外观与窗口", "快捷与启动", "更新与存档"):
+            self._settings_pages[name] = tk.Frame(content.body, bg=BG_BODY)
+            tab = tk.Button(navigation, text=name, command=lambda n=name: select_page(n),
+                            bg=BG_TITLE, fg=TEXT_MUTED, bd=0, relief="flat",
+                            activebackground=HOVER, activeforeground=TEXT,
+                            font=("Microsoft YaHei UI", 9, "bold"), pady=10, cursor="hand2")
+            tab.pack(side="left", fill="x", expand=True)
+            self._settings_tab_buttons[name] = tab
 
-        opacity_row = tk.Frame(window, bg=BG_BODY)
-        opacity_row.pack(fill="x", padx=22)
-        tk.Label(
-            opacity_row,
-            text="所有自由窗口的透明度",
-            bg=BG_BODY,
-            fg=TEXT,
-            font=("Microsoft YaHei UI", 10),
-        ).pack(side="left")
-        self.manager_opacity_value = tk.Label(
-            opacity_row,
-            text=f"{self.opacity_percent.get()}%",
-            bg=BG_BODY,
-            fg=ACCENT,
-            font=("Segoe UI", 10, "bold"),
-        )
+        def card(parent, title):
+            tk.Label(parent, text=title, bg=BG_BODY, fg=TEXT_MUTED,
+                     font=("Microsoft YaHei UI", 9), anchor="w").pack(fill="x", pady=(2, 8))
+            frame = tk.Frame(parent, bg=BG_PANEL, padx=16, pady=12)
+            frame.pack(fill="x", pady=(0, 14))
+            return frame
+        def switch(parent, title, hint, variable, command=None):
+            row = tk.Frame(parent, bg=BG_PANEL)
+            row.pack(fill="x", pady=5)
+            toggle = Toggle(row, variable, command)
+            toggle.pack(side="right", padx=(10, 0))
+            labels = tk.Frame(row, bg=BG_PANEL)
+            labels.pack(side="left", fill="x", expand=True)
+            tk.Label(labels, text=title, bg=BG_PANEL, fg=TEXT, anchor="w",
+                     font=("Microsoft YaHei UI", 10)).pack(fill="x")
+            tk.Label(labels, text=hint, bg=BG_PANEL, fg=TEXT_MUTED, anchor="w",
+                     font=("Microsoft YaHei UI", 8)).pack(fill="x", pady=(3, 0))
+            return toggle
+
+        page = self._settings_pages["外观与窗口"]
+        visual = card(page, "显示效果")
+        row = tk.Frame(visual, bg=BG_PANEL)
+        row.pack(fill="x")
+        tk.Label(row, text="窗口透明度", bg=BG_PANEL, fg=TEXT,
+                 font=("Microsoft YaHei UI", 10)).pack(side="left")
+        self.manager_opacity_value = tk.Label(row, text=f"{self.opacity_percent.get()}%",
+                                             bg=BG_PANEL, fg=ACCENT, font=("Segoe UI", 12, "bold"))
         self.manager_opacity_value.pack(side="right")
+        tk.Scale(visual, from_=55, to=100, orient="horizontal", variable=self.opacity_percent,
+                 command=self._on_opacity_changed, bg=BG_PANEL, fg=TEXT_MUTED,
+                 activebackground=ACCENT, troughcolor=BG_TITLE, highlightthickness=0,
+                 bd=0, showvalue=False, sliderlength=22).pack(fill="x", pady=(4, 10))
+        switch(visual, "无背景显示", "鼠标移开时只保留正文，移入后恢复控件", self.no_background)
+        behavior = card(page, "窗口行为")
+        switch(behavior, "贴边收起", "拖到屏幕边缘，收成一个小浮球", self.edge_collapse_enabled)
+        row = tk.Frame(behavior, bg=BG_PANEL)
+        row.pack(fill="x", pady=(12, 2))
+        tk.Label(row, text="展开后的边缘留白", bg=BG_PANEL, fg=TEXT,
+                 font=("Microsoft YaHei UI", 10)).pack(side="left")
+        tk.Label(row, text="px", bg=BG_PANEL, fg=TEXT_MUTED).pack(side="right", padx=(6, 0))
+        tk.Spinbox(row, from_=0, to=80, textvariable=self.restore_margin, width=5,
+                   justify="center", bg=BG_TITLE, fg=TEXT, buttonbackground=BG_TITLE,
+                   insertbackground=ACCENT, relief="flat", font=("Segoe UI", 10)).pack(side="right")
 
-        tk.Scale(
-            window,
-            from_=55,
-            to=100,
-            orient="horizontal",
-            variable=self.opacity_percent,
-            command=self._on_opacity_changed,
-            bg=BG_BODY,
-            fg=TEXT_MUTED,
-            activebackground=ACCENT,
-            troughcolor=BG_PANEL,
-            highlightthickness=0,
-            bd=0,
-            showvalue=False,
-            length=326,
-        ).pack(fill="x", padx=20, pady=(1, 5))
-
-        tk.Checkbutton(
-            window,
-            text="拖到屏幕边缘时收起为小球",
-            variable=self.edge_collapse_enabled,
-            bg=BG_BODY,
-            fg=TEXT,
-            activebackground=BG_BODY,
-            activeforeground=TEXT,
-            selectcolor=BG_PANEL,
-            font=("Microsoft YaHei UI", 10),
-            anchor="w",
-            highlightthickness=0,
-        ).pack(fill="x", padx=18, pady=(0, 4))
-
-        tk.Checkbutton(
-            window,
-            text="无背景（鼠标移入时才显示背景和按钮）",
-            variable=self.no_background,
-            bg=BG_BODY,
-            fg=TEXT,
-            activebackground=BG_BODY,
-            activeforeground=TEXT,
-            selectcolor=BG_PANEL,
-            font=("Microsoft YaHei UI", 10),
-            anchor="w",
-            highlightthickness=0,
-        ).pack(fill="x", padx=18, pady=(0, 4))
-
-        tk.Checkbutton(
-            window,
-            text="开机启动（当前 Windows 用户）",
-            variable=self.auto_start,
-            command=self._on_auto_start_changed,
-            bg=BG_BODY,
-            fg=TEXT,
-            activebackground=BG_BODY,
-            activeforeground=TEXT,
-            selectcolor=BG_PANEL,
-            font=("Microsoft YaHei UI", 10),
-            anchor="w",
-            highlightthickness=0,
-        ).pack(fill="x", padx=18, pady=(0, 4))
-
-        tk.Checkbutton(
-            window,
-            text="自动更新（启动时检查，退出后安装）",
-            variable=self.auto_update,
-            command=self._on_auto_update_changed,
-            bg=BG_BODY,
-            fg=TEXT,
-            activebackground=BG_BODY,
-            activeforeground=TEXT,
-            selectcolor=BG_PANEL,
-            font=("Microsoft YaHei UI", 10),
-            anchor="w",
-            highlightthickness=0,
-        ).pack(fill="x", padx=18, pady=(0, 4))
-
-        hotkey_row = tk.Frame(window, bg=BG_BODY)
-        hotkey_row.pack(fill="x", padx=22, pady=(0, 3))
-        tk.Label(
-            hotkey_row,
-            text="快捷隐藏快捷键",
-            bg=BG_BODY,
-            fg=TEXT,
-            font=("Microsoft YaHei UI", 10),
-        ).pack(side="left")
+        page = self._settings_pages["快捷与启动"]
+        keys = card(page, "快捷操作")
+        tk.Label(keys, text="隐藏 / 显示全部窗口", bg=BG_PANEL, fg=TEXT,
+                 font=("Microsoft YaHei UI", 11, "bold"), anchor="w").pack(fill="x")
+        tk.Label(keys, text="截图或演示前，一键清空桌面。再次按下恢复。", bg=BG_PANEL,
+                 fg=TEXT_MUTED, font=("Microsoft YaHei UI", 9), anchor="w").pack(fill="x", pady=(5, 14))
+        row = tk.Frame(keys, bg=BG_PANEL)
+        row.pack(fill="x")
         self.hide_hotkey_input = tk.StringVar(master=window, value=self.hide_hotkey)
-        hotkey_entry = tk.Entry(
-            hotkey_row,
-            textvariable=self.hide_hotkey_input,
-            width=15,
-            bg=BG_PANEL,
-            fg=TEXT,
-            insertbackground=TEXT,
-            relief="flat",
-            font=("Segoe UI", 10),
-        )
-        hotkey_entry.pack(side="left", padx=(10, 6), ipady=4)
-        hotkey_entry.bind("<Return>", lambda _event: self.apply_hide_hotkey())
-        tk.Button(
-            hotkey_row,
-            text="应用",
-            command=self.apply_hide_hotkey,
-            bg=BG_TITLE,
-            fg=ACCENT,
-            relief="flat",
-            bd=0,
-            cursor="hand2",
-        ).pack(side="right")
-        tk.Label(
-            window,
-            text="按一次全部隐藏，再按一次恢复；如 Ctrl+K、Ctrl+Shift+H。",
-            bg=BG_BODY,
-            fg=TEXT_MUTED,
-            font=("Microsoft YaHei UI", 8),
-            anchor="w",
-            justify="left",
-            wraplength=400,
-        ).pack(fill="x", padx=22, pady=(0, 5))
+        entry = tk.Entry(row, textvariable=self.hide_hotkey_input, bg=BG_TITLE, fg=ACCENT,
+                         insertbackground=ACCENT, relief="flat", font=("Segoe UI", 12), width=20)
+        entry.pack(side="left", fill="x", expand=True, ipady=7, padx=(0, 10))
+        entry.bind("<Return>", lambda event: self.apply_hide_hotkey())
+        styled_button(row, "应用", self.apply_hide_hotkey, primary=True).pack(side="right")
+        tk.Label(keys, text="快速收集     Ctrl + Alt + D", bg=BG_PANEL, fg=TEXT_MUTED,
+                 font=("Segoe UI", 10), anchor="w").pack(fill="x", pady=(14, 0))
+        startup = card(page, "启动方式")
+        self.startup_toggle = switch(startup, "开机启动", "登录当前 Windows 用户后自动运行",
+                                     self.auto_start, self._on_auto_start_changed)
 
-        margin_row = tk.Frame(window, bg=BG_BODY)
-        margin_row.pack(fill="x", padx=22)
-        tk.Label(
-            margin_row,
-            text="展开后距停靠边",
-            bg=BG_BODY,
-            fg=TEXT,
-            font=("Microsoft YaHei UI", 10),
-        ).pack(side="left")
-        tk.Label(
-            margin_row,
-            text="px",
-            bg=BG_BODY,
-            fg=TEXT_MUTED,
-            font=("Segoe UI", 9),
-        ).pack(side="right", padx=(5, 0))
-        tk.Spinbox(
-            margin_row,
-            from_=0,
-            to=80,
-            textvariable=self.restore_margin,
-            width=5,
-            justify="center",
-            bg=BG_PANEL,
-            fg=TEXT,
-            buttonbackground=BG_TITLE,
-            insertbackground=TEXT,
-            relief="flat",
-            font=("Segoe UI", 10),
-        ).pack(side="right")
+        page = self._settings_pages["更新与存档"]
+        updates = card(page, "保持最新")
+        self.update_toggle = switch(updates, "自动更新", "启动时检查，正常退出后安装",
+                                    self.auto_update, self._on_auto_update_changed)
+        self.update_status_label = tk.Label(updates, text=self._update_message, bg=BG_PANEL,
+                                            fg=TEXT_MUTED, font=("Microsoft YaHei UI", 9),
+                                            anchor="w", justify="left", wraplength=390)
+        self.update_status_label.pack(fill="x", pady=(8, 10))
+        self.update_button = styled_button(updates, "检查更新", lambda: self.check_for_updates(manual=True))
+        self.update_button.pack(anchor="w")
+        archive = card(page, "本地存档")
+        tk.Label(archive, text="便签和任务自动保存到本机。", bg=BG_PANEL, fg=TEXT_MUTED,
+                 font=("Microsoft YaHei UI", 9), anchor="w").pack(fill="x", pady=(0, 10))
+        row = tk.Frame(archive, bg=BG_PANEL)
+        row.pack(fill="x")
+        styled_button(row, "重试保存", self.retry_save).pack(side="left", padx=(0, 8))
+        styled_button(row, "导出备份…", self.export_backup).pack(side="left")
+        if self.window_store.load_warning or self.settings_store.load_warning:
+            styled_button(row, "恢复详情", self._show_recovery_notice).pack(side="right")
 
-        self.settings_note_label = tk.Label(
-            window,
-            text="",
-            bg=BG_BODY,
-            fg=TEXT_MUTED,
-            font=("Microsoft YaHei UI", 8),
-            anchor="w",
-            justify="left",
-            wraplength=350,
-        )
-        self.settings_note_label.pack(fill="x", padx=22, pady=(8, 8))
+        select_page("外观与窗口")
+        content.bind_mousewheel()
+        self._select_settings_page = select_page
+        self.settings_note_label = tk.Label(footer, bg=BG_BODY, fg=TEXT_MUTED,
+                                            font=("Microsoft YaHei UI", 8), anchor="w",
+                                            justify="left", wraplength=460)
+        self.settings_note_label.pack(fill="x", pady=(0, 10))
+        styled_button(footer, "恢复默认", self.reset_settings).pack(side="left")
+        styled_button(footer, "完成", self.close_settings, primary=True).pack(side="right")
         self._update_settings_note()
-
-        self.update_status_label = tk.Label(
-            window,
-            text=self._update_message,
-            bg=BG_BODY,
-            fg=TEXT_MUTED,
-            font=("Microsoft YaHei UI", 8),
-            anchor="w",
-            justify="left",
-            wraplength=350,
-        )
-        self.update_status_label.pack(fill="x", padx=22, pady=(0, 8))
-
-        actions = tk.Frame(window, bg=BG_BODY)
-        actions.pack(fill="x", padx=22, pady=(0, 12))
-        tk.Button(
-            actions,
-            text="恢复默认",
-            command=self.reset_settings,
-            bg=BG_PANEL,
-            fg=TEXT,
-            activebackground="#3A414E",
-            activeforeground=TEXT,
-            relief="flat",
-            bd=0,
-            font=("Microsoft YaHei UI", 9),
-            padx=14,
-            pady=6,
-            cursor="hand2",
-        ).pack(side="left")
-        self.update_button = tk.Button(
-            actions,
-            text="检查更新",
-            command=lambda: self.check_for_updates(manual=True),
-            bg=BG_PANEL,
-            fg=TEXT,
-            activebackground="#3A414E",
-            activeforeground=TEXT,
-            relief="flat",
-            bd=0,
-            font=("Microsoft YaHei UI", 9),
-            padx=14,
-            pady=6,
-            cursor="hand2",
-        )
-        self.update_button.pack(side="left", padx=(8, 0))
-        tk.Button(
-            actions,
-            text="关闭",
-            command=self.close_settings,
-            bg=ACCENT,
-            fg="#102219",
-            activebackground=ACCENT_HOVER,
-            activeforeground="#102219",
-            relief="flat",
-            bd=0,
-            font=("Microsoft YaHei UI", 9, "bold"),
-            padx=18,
-            pady=6,
-            cursor="hand2",
-        ).pack(side="right")
-
-        settings_width = 450
-        settings_height = 650
+        self._update_instance_count()
         cursor = Point()
         user32.GetCursorPos(ctypes.byref(cursor))
-        _monitor_area, work_area = _monitor_areas_at(cursor.x, cursor.y)
-        left, top, right, bottom = work_area
-        x = left + max(0, (right - left - settings_width) // 2)
-        y = top + max(0, (bottom - top - settings_height) // 2)
-        _set_absolute_geometry(
-            window,
-            width=settings_width,
-            height=settings_height,
-            x=x,
-            y=y,
-        )
-        self._update_instance_count()
+        _, (left, top, right, bottom) = _monitor_areas_at(cursor.x, cursor.y)
+        window.update_idletasks()
+        settings_width = max(520, window.winfo_reqwidth() + 16)
+        available_height = max(1, bottom - top - 64)
+        settings_height = min(max(680, window.winfo_reqheight() + 40), available_height)
+        window.minsize(settings_width, min(420, available_height))
+        _set_absolute_geometry(window, width=settings_width, height=settings_height,
+                               x=left + max(0, (right-left-settings_width)//2),
+                               y=top + max(0, (bottom-top-settings_height)//2))
         if self.visible:
             window.deiconify()
             window.lift()
@@ -5701,6 +4514,7 @@ class DesktopManager:
 
     def _tray_check_updates(self) -> None:
         self.open_settings()
+        self._select_settings_page("更新与存档")
         self.check_for_updates(manual=True)
 
     def _set_update_message(self, message: str, *, error: bool = False) -> None:
@@ -5797,6 +4611,8 @@ class DesktopManager:
             message = "窗口存档暂时无法写入磁盘；退出前会再次尝试。"
         elif self._settings_save_error:
             message = "设置暂时无法写入磁盘；退出前会再次尝试。"
+        elif self.window_store.load_warning or self.settings_store.load_warning:
+            message = "原存档异常，已保留恢复信息；请在“更新与存档”查看详情。"
         else:
             message = "设置与窗口存档会自动保存到本机。"
         try:
@@ -5856,7 +4672,7 @@ class DesktopManager:
             "hide_hotkey": self.hide_hotkey,
         }
 
-    def _save_settings_now(self) -> None:
+    def _save_settings_now(self) -> bool:
         pending_after = self._settings_save_after_id
         self._settings_save_after_id = None
         if pending_after is not None:
@@ -5865,17 +4681,70 @@ class DesktopManager:
             except tk.TclError:
                 pass
         if not self._settings_dirty:
-            return
+            return True
         try:
             self.settings_store.save(self._current_settings())
         except OSError:
             self._settings_dirty = True
             self._settings_save_error = True
             self._update_settings_note()
-            return
+            logging.getLogger("desktoptools").exception("Settings save failed")
+            return False
         self._settings_dirty = False
         self._settings_save_error = False
         self._update_settings_note()
+        return True
+
+    def _show_save_failure(self) -> None:
+        self.tray.notify("保存失败，程序仍在运行", "内容仍保留在内存中，请在设置中重试保存或导出备份。")
+        if self.visible:
+            self.open_settings()
+            self._select_settings_page("更新与存档")
+            messagebox.showerror(
+                "DesktopTools 保存失败",
+                "尚有内容未能写入磁盘，程序将继续运行以保留内容。\n"
+                "请在设置中重试保存，或导出备份到可写入的位置。",
+                parent=self.settings_window,
+            )
+
+    def retry_save(self) -> bool:
+        for window in tuple(self.windows):
+            self._on_window_state_changed(window)
+        windows_saved = self._save_window_states_now()
+        settings_saved = self._save_settings_now()
+        if not windows_saved or not settings_saved:
+            self._show_save_failure()
+            return False
+        self.tray.notify("保存成功", "窗口、任务与设置已写入磁盘。")
+        return True
+
+    def export_backup(self, path: Path | None = None) -> bool:
+        if path is None:
+            selected = filedialog.asksaveasfilename(
+                parent=self.settings_window, title="导出窗口与任务备份",
+                defaultextension=".json", initialfile="DesktopTools-backup.json",
+                filetypes=[("JSON 存档", "*.json")],
+            )
+            if not selected:
+                return False
+            path = Path(selected)
+        if path.resolve() in (self.window_store.path.resolve(), self.settings_store.path.resolve()):
+            if self.visible:
+                messagebox.showerror("无法导出", "请选择原存档以外的备份位置。", parent=self.settings_window)
+            return False
+        for window in tuple(self.windows):
+            self._on_window_state_changed(window)
+        try:
+            WindowStateStore(path).save(
+                self._window_records, [task.snapshot() for task in self._tasks.values()],
+            )
+        except OSError:
+            logging.getLogger("desktoptools").exception("Backup export failed")
+            if self.visible:
+                messagebox.showerror("导出失败", "无法写入备份，请选择其他位置。", parent=self.settings_window)
+            return False
+        self.tray.notify("备份已导出", str(path))
+        return True
 
     def reset_settings(self) -> None:
         self.opacity_percent.set(86)
@@ -5914,7 +4783,11 @@ class DesktopManager:
             return
         for window in tuple(self.windows):
             self._on_window_state_changed(window)
-        self._save_window_states_now()
+        windows_saved = self._save_window_states_now()
+        settings_saved = self._save_settings_now()
+        if not windows_saved or not settings_saved:
+            self._show_save_failure()
+            return
         self._exiting = True
         self.close_quick_capture()
         self.close_settings()
@@ -5959,7 +4832,7 @@ class DesktopManager:
                 )
             except OSError:
                 # Keep the verified staged package for the next manual attempt.
-                pass
+                logging.getLogger("desktoptools").exception("Failed to launch update installer")
 
     def run(self) -> None:
         self.root.mainloop()
@@ -6205,7 +5078,7 @@ def _self_test() -> None:
     assert app.status_label.cget("bg") == TRANSPARENT_KEY
     assert app.status_label.cget("fg") == TRANSPARENT_KEY
     assert app.status_label.winfo_manager() == ""
-    assert app.message_label.cget("fg") == TEXT
+    assert app.message_label.cget("fg") == TEXT_MUTED
     assert app.message_label.winfo_manager() == ""
     assert app.close_button.cget("fg") == TRANSPARENT_KEY
     assert app.close_button.cget("text") == ""
@@ -6515,7 +5388,7 @@ def _self_test() -> None:
         directory=Path(temporary_settings_directory.name) / "updates",
         opener=fake_release_opener,
     )
-    assert _version_numbers("2.3.1") > _version_numbers(APP_VERSION)
+    assert _version_numbers("2.3.1") > _version_numbers("2.3.0")
     assert release_client.latest() == fake_manifest
     staged_test_package = release_client.download(fake_manifest)
     assert staged_test_package.read_bytes() == fake_package
@@ -6714,20 +5587,14 @@ def _self_test() -> None:
         time.sleep(0.01)
     assert manager.settings_window is not None
     manager.root.update_idletasks()
-    assert manager.settings_window.winfo_reqwidth() <= 450, (
+    assert manager.settings_window.winfo_reqwidth() <= 520, (
         manager.settings_window.winfo_reqwidth()
     )
     assert manager.settings_window.winfo_reqheight() <= 650, (
         f"settings controls do not fit: {manager.settings_window.winfo_reqheight()}"
     )
     assert manager.update_button.cget("text") == "检查更新"
-    update_controls = [
-        child
-        for child in manager.settings_window.winfo_children()
-        if isinstance(child, tk.Checkbutton)
-        and child.cget("text").startswith("自动更新")
-    ]
-    assert len(update_controls) == 1
+    assert manager.update_toggle.winfo_exists()
     assert manager.auto_update.get() is False
     manager.tray.dispatch_command_for_test(TRAY_COMMAND_UPDATE)
     deadline = time.monotonic() + 2
@@ -6740,13 +5607,7 @@ def _self_test() -> None:
         time.sleep(0.01)
     assert "最新版本" in manager._update_message or "仅适用于" in manager._update_message
     assert manager.auto_start.get() is False
-    startup_controls = [
-        child
-        for child in manager.settings_window.winfo_children()
-        if isinstance(child, tk.Checkbutton)
-        and child.cget("text").startswith("开机启动")
-    ]
-    assert len(startup_controls) == 1
+    startup_controls = [manager.startup_toggle]
     memory_auto_start.fail_next = True
     startup_controls[0].invoke()
     assert manager.auto_start.get() is False
@@ -7294,10 +6155,12 @@ def _position_from_arguments(arguments: list[str]) -> tuple[int, int] | None:
 
 if __name__ == "__main__":
     if len(sys.argv) >= 2 and sys.argv[1] == "--apply-update":
+        configure_logging(_default_settings_path().parent / "logs")
         sys.exit(_apply_staged_update(sys.argv[2:]))
     elif "--self-test" in sys.argv:
         _self_test()
     else:
+        configure_logging(_default_settings_path().parent / "logs")
         instance_guard = SingleInstanceGuard()
         if not instance_guard.acquire():
             _signal_existing_instance()
@@ -7306,5 +6169,8 @@ if __name__ == "__main__":
             DesktopManager(
                 initial_position=_position_from_arguments(sys.argv[1:])
             ).run()
+        except Exception:
+            logging.getLogger("desktoptools").exception("Application startup or main loop failed")
+            raise
         finally:
             instance_guard.close()
